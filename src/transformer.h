@@ -38,23 +38,39 @@ class FeedForward {
 
   // `rows` is how many rows are real; see Linear's note on padded sequences.
   Sequence forward(const Sequence& x, std::size_t rows = SeqLen) {
+    const RowSpan all{0, rows < SeqLen ? rows : SeqLen};
+    return forward(x, RowSpans(&all, 1));
+  }
+
+  // Only the rows inside `spans` -- e.g. the real rows of each example in a
+  // batch. The rest of the result is zero.
+  Sequence forward(const Sequence& x, RowSpans spans) {
     x_ = x;
-    rows_ = rows < SeqLen ? rows : SeqLen;
-    h_pre_ = fc1_.template forward<SeqLen>(x, rows_);
-    const std::size_t active = rows_ * FfHidden;
-    for (std::size_t i = 0; i < active; ++i) {
-      h_[i] = activation_apply(act_, h_pre_[i]);
+    spans_.assign(spans.begin(), spans.end());
+    h_pre_.fill(T{});
+    fc1_.forward_spans(x, h_pre_, spans);
+    for (const RowSpan& s : spans_) {
+      // The derivative is stored now, while its tanh is at hand.
+      for (std::size_t i = s.start * FfHidden; i < (s.start + s.count) * FfHidden; ++i) {
+        h_[i] = activation_apply_with_grad(act_, h_pre_[i], &dact_[i]);
+      }
     }
-    return fc2_.template forward<SeqLen>(h_, rows_);
+    Sequence out;
+    fc2_.forward_spans(h_, out, spans);
+    return out;
   }
 
   Sequence backward(const Sequence& d_out) {
-    HiddenSequence dh = fc2_.template backward<SeqLen>(h_, d_out, rows_);
-    const std::size_t active = rows_ * FfHidden;
-    for (std::size_t i = 0; i < active; ++i) {
-      dh[i] *= activation_grad(act_, h_pre_[i]);
+    HiddenSequence dh;
+    fc2_.backward_spans(h_, d_out, dh, spans_);
+    for (const RowSpan& s : spans_) {
+      for (std::size_t i = s.start * FfHidden; i < (s.start + s.count) * FfHidden; ++i) {
+        dh[i] *= dact_[i];
+      }
     }
-    return fc1_.template backward<SeqLen>(x_, dh, rows_);
+    Sequence dx;
+    fc1_.backward_spans(x_, dh, dx, spans_);
+    return dx;
   }
 
   void zero_grad() {
@@ -75,10 +91,11 @@ class FeedForward {
   Linear<T, ModelDim, FfHidden> fc1_;
   Linear<T, FfHidden, ModelDim> fc2_;
 
-  std::size_t rows_ = SeqLen;
+  std::vector<RowSpan> spans_;
   Sequence x_;
   HiddenSequence h_pre_;
   HiddenSequence h_;
+  HiddenSequence dact_;  // activation derivative at h_pre_
 };
 
 // One pre-norm transformer block:
@@ -88,21 +105,25 @@ class FeedForward {
 // Sequence length, model width and FFN width are template parameters, so all
 // parameter tensors are shape-checked. Head count, causal masking and the FFN
 // activation are runtime settings; none of them changes a parameter shape.
+// `Batch` stacks that many independent sequences row-wise; see
+// MultiHeadSelfAttention.
 template <typename T, std::size_t SeqLen, std::size_t ModelDim,
-          std::size_t FfHidden>
+          std::size_t FfHidden, std::size_t Batch = 1>
 class TransformerBlock {
   static_assert(std::is_floating_point_v<T>,
                 "trainable models require a floating point element type");
 
  public:
   using value_type = T;
-  using Sequence = Tensor<T, SeqLen, ModelDim>;
+  using Attention = MultiHeadSelfAttention<T, SeqLen, ModelDim, Batch>;
+  using Sequence = typename Attention::Sequence;
 
   static constexpr std::size_t seq_len = SeqLen;
   static constexpr std::size_t model_dim = ModelDim;
   static constexpr std::size_t ff_hidden = FfHidden;
+  static constexpr std::size_t batch = Batch;
   static constexpr std::size_t parameter_count =
-      MultiHeadSelfAttention<T, SeqLen, ModelDim>::parameter_count +
+      Attention::parameter_count +
       FeedForward<T, SeqLen, ModelDim, FfHidden>::parameter_count +
       2 * LayerNorm<T, ModelDim>::parameter_count;
 
@@ -114,9 +135,12 @@ class TransformerBlock {
   bool causal() const { return attn_.causal(); }
   void set_causal(bool causal) { attn_.set_causal(causal); }
   std::size_t valid_length() const { return attn_.valid_length(); }
-  void set_valid_length(std::size_t length) {
-    attn_.set_valid_length(length);
+  std::size_t valid_length(std::size_t b) const { return attn_.valid_length(b); }
+  void set_valid_length(std::size_t length) { attn_.set_valid_length(length); }
+  void set_valid_length(std::size_t b, std::size_t length) {
+    attn_.set_valid_length(b, length);
   }
+  RowSpans row_spans() const { return attn_.row_spans(); }
 
   template <typename Rng>
   void randomize(Rng& rng) {
@@ -125,29 +149,26 @@ class TransformerBlock {
   }
 
   Sequence forward(const Sequence& x) {
-    // How much of the sequence is real. Every sublayer gets the same answer,
-    // so a padded tail is skipped by the whole block rather than only by the
-    // attention inside it.
-    const std::size_t rows = attn_.valid_length();
+    // Which rows are real. Every sublayer gets the same answer, so a padded
+    // tail is skipped by the whole block rather than only by the attention.
+    const RowSpans rows = row_spans();
     x_ = x;
-    ln1_out_ = ln1_.template forward<SeqLen>(x, rows);
+    ln1_out_ = ln1_.forward(x, rows);
     h_ = add(x, attn_.forward(ln1_out_));
-    ln2_out_ = ln2_.template forward<SeqLen>(h_, rows);
+    ln2_out_ = ln2_.forward(h_, rows);
     return add(h_, ff_.forward(ln2_out_, rows));
   }
 
   // Returns dL/dx. Must follow a matching forward().
   Sequence backward(const Sequence& d_out) {
-    const std::size_t rows = attn_.valid_length();
+    const RowSpans rows = row_spans();
     // y = h + ff(ln2(h)): the residual sends d_out down both paths
     Sequence dh = d_out;
-    add_into(dh,
-             ln2_.template backward<SeqLen>(h_, ff_.backward(d_out), rows));
+    add_into(dh, ln2_.backward(h_, ff_.backward(d_out), rows));
 
     // h = x + attn(ln1(x)): likewise
     Sequence dx = dh;
-    add_into(dx,
-             ln1_.template backward<SeqLen>(x_, attn_.backward(dh), rows));
+    add_into(dx, ln1_.backward(x_, attn_.backward(dh), rows));
     return dx;
   }
 
@@ -165,14 +186,14 @@ class TransformerBlock {
     ln2_.apply_sgd(lr);
   }
 
-  MultiHeadSelfAttention<T, SeqLen, ModelDim>& attention() { return attn_; }
-  FeedForward<T, SeqLen, ModelDim, FfHidden>& feed_forward() { return ff_; }
+  Attention& attention() { return attn_; }
+  FeedForward<T, Batch * SeqLen, ModelDim, FfHidden>& feed_forward() { return ff_; }
   LayerNorm<T, ModelDim>& attention_norm() { return ln1_; }
   LayerNorm<T, ModelDim>& feed_forward_norm() { return ln2_; }
 
  private:
-  MultiHeadSelfAttention<T, SeqLen, ModelDim> attn_;
-  FeedForward<T, SeqLen, ModelDim, FfHidden> ff_;
+  Attention attn_;
+  FeedForward<T, Batch * SeqLen, ModelDim, FfHidden> ff_;
   LayerNorm<T, ModelDim> ln1_;
   LayerNorm<T, ModelDim> ln2_;
 
@@ -186,15 +207,15 @@ class TransformerBlock {
 // A stack of identical blocks plus a final layer norm. Depth is runtime: every
 // block has the same parameter shapes, so it cannot affect type safety.
 template <typename T, std::size_t SeqLen, std::size_t ModelDim,
-          std::size_t FfHidden>
+          std::size_t FfHidden, std::size_t Batch = 1>
 class Transformer {
   static_assert(std::is_floating_point_v<T>,
                 "trainable models require a floating point element type");
 
  public:
   using value_type = T;
-  using Sequence = Tensor<T, SeqLen, ModelDim>;
-  using Block = TransformerBlock<T, SeqLen, ModelDim, FfHidden>;
+  using Block = TransformerBlock<T, SeqLen, ModelDim, FfHidden, Batch>;
+  using Sequence = typename Block::Sequence;
 
   static constexpr std::size_t seq_len = SeqLen;
   static constexpr std::size_t model_dim = ModelDim;
@@ -223,6 +244,11 @@ class Transformer {
       block.set_valid_length(length);
     }
   }
+  void set_valid_length(std::size_t b, std::size_t length) {
+    for (Block& block : blocks_) {
+      block.set_valid_length(b, length);
+    }
+  }
 
   std::size_t parameter_count() const {
     return blocks_.size() * Block::parameter_count +
@@ -240,17 +266,18 @@ class Transformer {
     Sequence cur = x;
     for (Block& b : blocks_) {
       cur = b.forward(cur);
+      ZF_CHECK_FINITE(cur, "transformer block forward");
     }
     final_in_ = cur;
-    return ln_f_.template forward<SeqLen>(cur);
+    return ln_f_.forward(cur, blocks_.front().row_spans());
   }
 
   // Returns dL/dx. Must follow a matching forward().
   Sequence backward(const Sequence& d_out) {
-    Sequence d =
-        ln_f_.template backward<SeqLen>(final_in_, d_out, valid_length());
+    Sequence d = ln_f_.backward(final_in_, d_out, blocks_.front().row_spans());
     for (std::size_t i = blocks_.size(); i-- > 0;) {
       d = blocks_[i].backward(d);
+      ZF_CHECK_FINITE(d, "transformer block backward");
     }
     return d;
   }

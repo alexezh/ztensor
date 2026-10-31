@@ -21,16 +21,38 @@ namespace zf {
 
 enum class Activation { kIdentity, kRelu, kGelu };
 
+inline float softmax_exp(float x);  // defined below, with the softmax
+
+// tanh for the GELU. std::tanh is a library call per element, so the loop
+// around it cannot vectorize; in a training step it was about 13% of the
+// time. tanh is odd, and for a = |u|
+//   tanh(a) = (1 - e) / (1 + e),  e = exp(-2a) in (0, 1]
+// which needs exp only of non-positive arguments -- exactly the range
+// softmax_exp covers, to about 3 ulp. Branch-free, so it vectorizes.
+// Other element types keep std::tanh.
+template <typename T>
+inline T fast_tanh(T u) {
+  if constexpr (std::is_same_v<T, float>) {
+    const float e = softmax_exp(-2.0f * std::fabs(u));
+    return std::copysign((1.0f - e) / (1.0f + e), u);
+  } else {
+    return std::tanh(u);
+  }
+}
+
 template <typename T>
 T activation_apply(Activation act, T x) {
   switch (act) {
     case Activation::kRelu:
       return x > T{0} ? x : T{0};
     case Activation::kGelu: {
-      // tanh approximation of GELU
+      // tanh approximation of GELU. u is written exactly as in
+      // activation_grad and activation_apply_with_grad, so all three round
+      // the same way.
       const T c = static_cast<T>(0.7978845608028654);  // sqrt(2/pi)
-      const T u = c * (x + static_cast<T>(0.044715) * x * x * x);
-      return static_cast<T>(0.5) * x * (T{1} + std::tanh(u));
+      const T x2 = x * x;
+      const T u = c * (x + static_cast<T>(0.044715) * x * x2);
+      return static_cast<T>(0.5) * x * (T{1} + fast_tanh(u));
     }
     case Activation::kIdentity:
       break;
@@ -48,7 +70,7 @@ T activation_grad(Activation act, T x) {
       const T c = static_cast<T>(0.7978845608028654);
       const T x2 = x * x;
       const T u = c * (x + static_cast<T>(0.044715) * x * x2);
-      const T t = std::tanh(u);
+      const T t = fast_tanh(u);
       const T du = c * (T{1} + static_cast<T>(3 * 0.044715) * x2);
       return static_cast<T>(0.5) * (T{1} + t) +
              static_cast<T>(0.5) * x * (T{1} - t * t) * du;
@@ -59,7 +81,76 @@ T activation_grad(Activation act, T x) {
   return T{1};
 }
 
+// Activation and its derivative together, sharing the one tanh. A layer that
+// will need the derivative in backward stores it here instead of recomputing.
+template <typename T>
+T activation_apply_with_grad(Activation act, T x, T* grad) {
+  switch (act) {
+    case Activation::kRelu:
+      *grad = x > T{0} ? T{1} : T{0};
+      return x > T{0} ? x : T{0};
+    case Activation::kGelu: {
+      const T c = static_cast<T>(0.7978845608028654);
+      const T x2 = x * x;
+      const T u = c * (x + static_cast<T>(0.044715) * x * x2);
+      const T t = fast_tanh(u);
+      const T du = c * (T{1} + static_cast<T>(3 * 0.044715) * x2);
+      *grad = static_cast<T>(0.5) * (T{1} + t) +
+              static_cast<T>(0.5) * x * (T{1} - t * t) * du;
+      return static_cast<T>(0.5) * x * (T{1} + t);
+    }
+    case Activation::kIdentity:
+      break;
+  }
+  *grad = T{1};
+  return x;
+}
+
 // y = W x + b, with W stored as [OutDim, InDim].
+// A 4-wide SIMD value for the kernels: NEON / SSE registers through the
+// compiler's vector extension, plain arrays elsewhere.
+#if defined(__clang__) || defined(__GNUC__)
+template <typename T>
+using Vec4 = T __attribute__((vector_size(4 * sizeof(T))));
+#else
+template <typename T>
+struct Vec4 {
+  T v[4] = {};
+  T& operator[](std::size_t i) { return v[i]; }
+  T operator[](std::size_t i) const { return v[i]; }
+  Vec4& operator+=(const Vec4& o) {
+    for (std::size_t i = 0; i < 4; ++i) v[i] += o.v[i];
+    return *this;
+  }
+  friend Vec4 operator+(Vec4 a, const Vec4& b) { return a += b; }
+  friend Vec4 operator*(Vec4 a, const Vec4& b) {
+    for (std::size_t i = 0; i < 4; ++i) a.v[i] *= b.v[i];
+    return a;
+  }
+  friend Vec4 operator*(T s, Vec4 a) {
+    for (std::size_t i = 0; i < 4; ++i) a.v[i] *= s;
+    return a;
+  }
+};
+#endif
+
+template <typename T>
+ZF_ALWAYS_INLINE Vec4<T> load4(const T* p) {
+  Vec4<T> v;
+  std::memcpy(&v, p, sizeof(v));
+  return v;
+}
+
+template <typename T>
+ZF_ALWAYS_INLINE void store4(T* p, const Vec4<T>& v) {
+  std::memcpy(p, &v, sizeof(v));
+}
+
+template <typename T>
+ZF_ALWAYS_INLINE T hsum4(const Vec4<T>& v) {
+  return (v[0] + v[1]) + (v[2] + v[3]);
+}
+
 template <typename T, std::size_t InDim, std::size_t OutDim>
 class Linear {
   static_assert(std::is_floating_point_v<T>,
@@ -93,179 +184,182 @@ class Linear {
 
   // --- the kernels ---
   //
-  // These two do all the arithmetic in the library: every projection, every
+  // These do all the arithmetic in the library: every projection, every
   // feed-forward layer and every head is a call into one of them. They are
   // written for the machine rather than for the page, so the shape is
   // explained here.
   //
-  // Two things cost time in the obvious triple loop.
+  // Three things cost time in the obvious triple loop.
   //
   // One: `sum += w[i] * x[i]` is a chain where every multiply-add waits for
   // the one before it, so the loop runs at the latency of an FMA instead of
   // its throughput. Reassociating floating-point addition changes the result,
-  // so a compiler will not split the chain unless told it may. Four partial
-  // sums are four independent chains, and also the shape a 4-wide vector
-  // reduction wants.
+  // so a compiler will not split the chain unless told it may. A 4-wide
+  // vector accumulator is four independent chains.
   //
-  // Two: computing one output at a time re-reads the whole input row for each
-  // row of W. Four outputs at once read the input row once and keep sixteen
-  // accumulator lanes in flight, which is enough independent work to fill the
-  // pipeline.
+  // Two: computing one output at a time re-reads the input row for each row
+  // of W. A block of 4 outputs reads the input once.
   //
-  // Together these are about five times faster than the straightforward
-  // version on the shapes this library uses. The summation order differs from
-  // strict left-to-right; measured against single-accumulator summation the
-  // worst relative difference is around 6e-7, and every backward() here is
-  // checked against central differences, which is a far coarser instrument.
+  // Three: computing one input row at a time re-reads all of W for each row.
+  // A block of 4 rows reads each weight vector once for all four, so a block
+  // does 16 multiply-adds per 8 loads instead of 4 per 5. Sequences and
+  // batches are where this pays.
+  //
+  // The kernels use explicit 4-wide vector types (Vec4). Written as plain
+  // arrays, the compiler is free to vectorize across the four outputs instead
+  // of along the row, and when W sits inline in the object it does exactly
+  // that, with transposes and spills, at about half the speed.
+  //
+  // Summation order: per output, lanes over i, then (l0 + l1) + (l2 + l3),
+  // then the leftover columns, then the bias -- the same for a block of rows
+  // as for one row, so batching a row changes no result. Gradients also
+  // accumulate row by row in order, so the 4-row backward matches the
+  // one-row backward exactly.
   //
   // `benchmarks/tensor_bench.cpp` is where these claims are checked.
   static constexpr std::size_t kLanes = 4;
-  static constexpr std::size_t kBlock = 4;
+  static constexpr std::size_t kBlock = 4;     // outputs per block
+  static constexpr std::size_t kRowBlock = 4;  // input rows per block
+  static constexpr std::size_t kVecIn = InDim / kLanes * kLanes;
+  static constexpr std::size_t kVecOut = OutDim / kBlock * kBlock;
+  using V = Vec4<T>;
 
-  // Plain dot product with four independent accumulators. Used for the
-  // leftover outputs when OutDim is not a multiple of the block.
-  static T dot_row(const T* ZF_RESTRICT a, const T* ZF_RESTRICT b,
-                   std::size_t n) {
-    T acc[kLanes] = {};
-    std::size_t i = 0;
-    for (; i + kLanes <= n; i += kLanes) {
-      for (std::size_t k = 0; k < kLanes; ++k) {
-        acc[k] += a[i + k] * b[i + k];
-      }
-    }
-    T sum = (acc[0] + acc[1]) + (acc[2] + acc[3]);
-    for (; i < n; ++i) {
-      sum += a[i] * b[i];
-    }
-    return sum;
-  }
-
-  // out[0..OutDim) = b + W x, for one input row. `out` must not overlap
-  // anything else.
-  ZF_ALWAYS_INLINE void matvec(const T* ZF_RESTRICT x,
-                               T* ZF_RESTRICT out) const {
+  // out[r * OutDim + o] = b + W x_r for R rows starting at x. `out` must not
+  // overlap anything else.
+  template <std::size_t R>
+  ZF_ALWAYS_INLINE void matmul_rows(const T* ZF_RESTRICT x,
+                                    T* ZF_RESTRICT out) const {
     const T* ZF_RESTRICT w = w_.data();
-    std::size_t o = 0;
-    for (; o + kBlock <= OutDim; o += kBlock) {
-      const T* ZF_RESTRICT w0 = w + (o + 0) * InDim;
-      const T* ZF_RESTRICT w1 = w + (o + 1) * InDim;
-      const T* ZF_RESTRICT w2 = w + (o + 2) * InDim;
-      const T* ZF_RESTRICT w3 = w + (o + 3) * InDim;
-      T a0[kLanes] = {};
-      T a1[kLanes] = {};
-      T a2[kLanes] = {};
-      T a3[kLanes] = {};
-      std::size_t i = 0;
-      for (; i + kLanes <= InDim; i += kLanes) {
-        for (std::size_t k = 0; k < kLanes; ++k) {
-          const T xv = x[i + k];
-          a0[k] += w0[i + k] * xv;
-          a1[k] += w1[i + k] * xv;
-          a2[k] += w2[i + k] * xv;
-          a3[k] += w3[i + k] * xv;
+    for (std::size_t o = 0; o < kVecOut; o += kBlock) {
+      V acc[R][kBlock] = {};
+      for (std::size_t i = 0; i < kVecIn; i += kLanes) {
+        V xv[R];
+        for (std::size_t r = 0; r < R; ++r) xv[r] = load4(x + r * InDim + i);
+        for (std::size_t c = 0; c < kBlock; ++c) {
+          const V wv = load4(w + (o + c) * InDim + i);
+          for (std::size_t r = 0; r < R; ++r) acc[r][c] += wv * xv[r];
         }
       }
-      T s0 = (a0[0] + a0[1]) + (a0[2] + a0[3]);
-      T s1 = (a1[0] + a1[1]) + (a1[2] + a1[3]);
-      T s2 = (a2[0] + a2[1]) + (a2[2] + a2[3]);
-      T s3 = (a3[0] + a3[1]) + (a3[2] + a3[3]);
-      // The widths are compile-time constants, so when they divide evenly the
-      // leftover loops are not merely unexecuted, they are not emitted. Left
-      // in as runtime code they cost more than the arithmetic they guard: the
-      // compiler cannot prove them dead, so it stops unrolling the loop above
-      // and spills the accumulators.
-      if constexpr (InDim % kLanes != 0) {
-        for (; i < InDim; ++i) {
-          const T xv = x[i];
-          s0 += w0[i] * xv;
-          s1 += w1[i] * xv;
-          s2 += w2[i] * xv;
-          s3 += w3[i] * xv;
+      for (std::size_t r = 0; r < R; ++r) {
+        for (std::size_t c = 0; c < kBlock; ++c) {
+          T sum = hsum4(acc[r][c]);
+          // The widths are compile-time constants, so when they divide evenly
+          // the leftover loops are not emitted at all.
+          if constexpr (InDim % kLanes != 0) {
+            const T* ZF_RESTRICT wo = w + (o + c) * InDim;
+            for (std::size_t i = kVecIn; i < InDim; ++i) {
+              sum += wo[i] * x[r * InDim + i];
+            }
+          }
+          out[r * OutDim + o + c] = b_(o + c) + sum;
         }
       }
-      out[o + 0] = b_(o + 0) + s0;
-      out[o + 1] = b_(o + 1) + s1;
-      out[o + 2] = b_(o + 2) + s2;
-      out[o + 3] = b_(o + 3) + s3;
     }
     if constexpr (OutDim % kBlock != 0) {
-      for (; o < OutDim; ++o) {
-        out[o] = b_(o) + dot_row(w + o * InDim, x, InDim);
+      for (std::size_t r = 0; r < R; ++r) {
+        for (std::size_t o = kVecOut; o < OutDim; ++o) {
+          out[r * OutDim + o] = b_(o) + dot_row(w + o * InDim, x + r * InDim);
+        }
       }
     }
   }
 
-  // Accumulates dW and db for one row, and adds that row's dx into `dx`.
-  //
-  // dx is built up in a local row and added once at the end: accumulating
-  // straight into the output would read and write the same memory OutDim
-  // times, where a local row stays in registers and cache.
-  ZF_ALWAYS_INLINE void matvec_backward(const T* ZF_RESTRICT x,
-                                        const T* ZF_RESTRICT g,
-                                        T* ZF_RESTRICT dx) {
+  // For R rows: accumulates dW and db, and adds each row's dx into `dx`.
+  // dx is built in a local block and added once at the end, so the inner
+  // loop's read-modify-write stays in registers and L1.
+  template <std::size_t R>
+  ZF_ALWAYS_INLINE void matmul_rows_backward(const T* ZF_RESTRICT x,
+                                             const T* ZF_RESTRICT g,
+                                             T* ZF_RESTRICT dx) {
     const T* ZF_RESTRICT w = w_.data();
     T* ZF_RESTRICT dw = dw_.data();
-    T local[InDim] = {};
-    std::size_t o = 0;
-    for (; o + kBlock <= OutDim; o += kBlock) {
-      const T g0 = g[o + 0];
-      const T g1 = g[o + 1];
-      const T g2 = g[o + 2];
-      const T g3 = g[o + 3];
-      db_(o + 0) += g0;
-      db_(o + 1) += g1;
-      db_(o + 2) += g2;
-      db_(o + 3) += g3;
-      T* ZF_RESTRICT d0 = dw + (o + 0) * InDim;
-      T* ZF_RESTRICT d1 = dw + (o + 1) * InDim;
-      T* ZF_RESTRICT d2 = dw + (o + 2) * InDim;
-      T* ZF_RESTRICT d3 = dw + (o + 3) * InDim;
-      const T* ZF_RESTRICT w0 = w + (o + 0) * InDim;
-      const T* ZF_RESTRICT w1 = w + (o + 1) * InDim;
-      const T* ZF_RESTRICT w2 = w + (o + 2) * InDim;
-      const T* ZF_RESTRICT w3 = w + (o + 3) * InDim;
-      for (std::size_t i = 0; i < InDim; ++i) {
-        const T xv = x[i];
-        d0[i] += g0 * xv;
-        d1[i] += g1 * xv;
-        d2[i] += g2 * xv;
-        d3[i] += g3 * xv;
-        local[i] += g0 * w0[i] + g1 * w1[i] + g2 * w2[i] + g3 * w3[i];
+    alignas(16) T local[R][InDim] = {};
+    for (std::size_t o = 0; o < kVecOut; o += kBlock) {
+      T gr[R][kBlock];
+      for (std::size_t c = 0; c < kBlock; ++c) {
+        for (std::size_t r = 0; r < R; ++r) {
+          gr[r][c] = g[r * OutDim + o + c];
+          db_(o + c) += gr[r][c];
+        }
       }
-    }
-    if constexpr (OutDim % kBlock != 0) {
-      for (; o < OutDim; ++o) {
-        const T gv = g[o];
-        db_(o) += gv;
-        T* ZF_RESTRICT dwo = dw + o * InDim;
-        const T* ZF_RESTRICT wo = w + o * InDim;
-        for (std::size_t i = 0; i < InDim; ++i) {
-          dwo[i] += gv * x[i];
-          local[i] += gv * wo[i];
+      for (std::size_t i = 0; i < kVecIn; i += kLanes) {
+        V xv[R];
+        for (std::size_t r = 0; r < R; ++r) xv[r] = load4(x + r * InDim + i);
+        V wv[kBlock];
+        for (std::size_t c = 0; c < kBlock; ++c) {
+          wv[c] = load4(w + (o + c) * InDim + i);
+          V d = load4(dw + (o + c) * InDim + i);
+          for (std::size_t r = 0; r < R; ++r) d += gr[r][c] * xv[r];
+          store4(dw + (o + c) * InDim + i, d);
+        }
+        for (std::size_t r = 0; r < R; ++r) {
+          V l = load4(&local[r][i]);
+          l += gr[r][0] * wv[0] + gr[r][1] * wv[1] + gr[r][2] * wv[2] +
+               gr[r][3] * wv[3];
+          store4(&local[r][i], l);
+        }
+      }
+      if constexpr (InDim % kLanes != 0) {
+        for (std::size_t i = kVecIn; i < InDim; ++i) {
+          for (std::size_t c = 0; c < kBlock; ++c) {
+            for (std::size_t r = 0; r < R; ++r) {
+              dw[(o + c) * InDim + i] += gr[r][c] * x[r * InDim + i];
+            }
+          }
+          for (std::size_t r = 0; r < R; ++r) {
+            local[r][i] += gr[r][0] * w[(o + 0) * InDim + i] +
+                           gr[r][1] * w[(o + 1) * InDim + i] +
+                           gr[r][2] * w[(o + 2) * InDim + i] +
+                           gr[r][3] * w[(o + 3) * InDim + i];
+          }
         }
       }
     }
-    for (std::size_t i = 0; i < InDim; ++i) {
-      dx[i] += local[i];
+    if constexpr (OutDim % kBlock != 0) {
+      for (std::size_t o = kVecOut; o < OutDim; ++o) {
+        T* ZF_RESTRICT dwo = dw + o * InDim;
+        const T* ZF_RESTRICT wo = w + o * InDim;
+        for (std::size_t r = 0; r < R; ++r) {
+          const T gv = g[r * OutDim + o];
+          db_(o) += gv;
+          for (std::size_t i = 0; i < InDim; ++i) {
+            dwo[i] += gv * x[r * InDim + i];
+            local[r][i] += gv * wo[i];
+          }
+        }
+      }
     }
+    for (std::size_t r = 0; r < R; ++r) {
+      for (std::size_t i = 0; i < InDim; ++i) dx[r * InDim + i] += local[r][i];
+    }
+  }
+
+  // Plain dot product over InDim with the kernels' summation order. Used for
+  // the leftover outputs when OutDim is not a multiple of the block.
+  static T dot_row(const T* ZF_RESTRICT a, const T* ZF_RESTRICT b) {
+    V acc{};
+    for (std::size_t i = 0; i < kVecIn; i += kLanes) acc += load4(a + i) * load4(b + i);
+    T sum = hsum4(acc);
+    for (std::size_t i = kVecIn; i < InDim; ++i) sum += a[i] * b[i];
+    return sum;
   }
 
   // --- single vector ---
 
   Tensor<T, OutDim> forward(const Tensor<T, InDim>& x) const {
     Tensor<T, OutDim> out;
-    matvec(x.data(), out.data());
+    matmul_rows<1>(x.data(), out.data());
     return out;
   }
 
   Tensor<T, InDim> backward(const Tensor<T, InDim>& x,
                             const Tensor<T, OutDim>& d_out) {
     Tensor<T, InDim> dx;
-    matvec_backward(x.data(), d_out.data(), dx.data());
+    matmul_rows_backward<1>(x.data(), d_out.data(), dx.data());
     return dx;
   }
 
-  // --- a stack of `Rows` vectors, e.g. a token sequence ---
+  // --- a stack of `Rows` vectors, e.g. a token sequence or a batch ---
   //
   // `rows` is how many of them are real. A padded sequence shares one
   // compile-time Rows; the rows past the valid length are read by nobody and
@@ -276,10 +370,7 @@ class Linear {
   Tensor<T, Rows, OutDim> forward(const Tensor<T, Rows, InDim>& x,
                                   std::size_t rows = Rows) const {
     Tensor<T, Rows, OutDim> out;
-    const std::size_t limit = rows < Rows ? rows : Rows;
-    for (std::size_t r = 0; r < limit; ++r) {
-      matvec(x.data() + r * InDim, out.data() + r * OutDim);
-    }
+    forward_into(x.data(), out.data(), rows < Rows ? rows : Rows);
     return out;
   }
 
@@ -288,12 +379,50 @@ class Linear {
                                   const Tensor<T, Rows, OutDim>& d_out,
                                   std::size_t rows = Rows) {
     Tensor<T, Rows, InDim> dx;
-    const std::size_t limit = rows < Rows ? rows : Rows;
-    for (std::size_t r = 0; r < limit; ++r) {
-      matvec_backward(x.data() + r * InDim, d_out.data() + r * OutDim,
-                      dx.data() + r * InDim);
-    }
+    backward_into(x.data(), d_out.data(), dx.data(), rows < Rows ? rows : Rows);
     return dx;
+  }
+
+  // Raw-pointer forms: `rows` rows of x (InDim each) into out (OutDim each),
+  // and the matching backward, which adds into dx.
+  void forward_into(const T* x, T* out, std::size_t rows) const {
+    std::size_t r = 0;
+    for (; r + kRowBlock <= rows; r += kRowBlock) {
+      matmul_rows<kRowBlock>(x + r * InDim, out + r * OutDim);
+    }
+    for (; r < rows; ++r) matmul_rows<1>(x + r * InDim, out + r * OutDim);
+  }
+
+  // Span forms over a row-stacked tensor: only rows inside `spans` are
+  // computed. forward_spans overwrites those rows of `out` and leaves the
+  // rest alone; backward_spans adds into those rows of `dx`.
+  template <std::size_t Rows>
+  void forward_spans(const Tensor<T, Rows, InDim>& x, Tensor<T, Rows, OutDim>& out,
+                     RowSpans spans) const {
+    for (const RowSpan& s : spans) {
+      forward_into(x.data() + s.start * InDim, out.data() + s.start * OutDim, s.count);
+    }
+  }
+
+  template <std::size_t Rows>
+  void backward_spans(const Tensor<T, Rows, InDim>& x,
+                      const Tensor<T, Rows, OutDim>& d_out,
+                      Tensor<T, Rows, InDim>& dx, RowSpans spans) {
+    for (const RowSpan& s : spans) {
+      backward_into(x.data() + s.start * InDim, d_out.data() + s.start * OutDim,
+                    dx.data() + s.start * InDim, s.count);
+    }
+  }
+
+  void backward_into(const T* x, const T* d_out, T* dx, std::size_t rows) {
+    std::size_t r = 0;
+    for (; r + kRowBlock <= rows; r += kRowBlock) {
+      matmul_rows_backward<kRowBlock>(x + r * InDim, d_out + r * OutDim,
+                                      dx + r * InDim);
+    }
+    for (; r < rows; ++r) {
+      matmul_rows_backward<1>(x + r * InDim, d_out + r * OutDim, dx + r * InDim);
+    }
   }
 
   void zero_grad() {
@@ -427,6 +556,31 @@ class LayerNorm {
     T* ZF_RESTRICT dxp = dx.data();
     for (std::size_t r = 0; r < limit; ++r) {
       normalize_row_backward(xp + r * Dim, gp + r * Dim, dxp + r * Dim);
+    }
+    return dx;
+  }
+
+  // Only the rows inside `spans`; the rest of the result is zero.
+  template <std::size_t Rows>
+  Tensor<T, Rows, Dim> forward(const Tensor<T, Rows, Dim>& x, RowSpans spans) const {
+    Tensor<T, Rows, Dim> out;
+    for (const RowSpan& s : spans) {
+      for (std::size_t r = s.start; r < s.start + s.count; ++r) {
+        normalize_row(x.data() + r * Dim, out.data() + r * Dim);
+      }
+    }
+    return out;
+  }
+
+  template <std::size_t Rows>
+  Tensor<T, Rows, Dim> backward(const Tensor<T, Rows, Dim>& x,
+                                const Tensor<T, Rows, Dim>& d_out, RowSpans spans) {
+    Tensor<T, Rows, Dim> dx;
+    for (const RowSpan& s : spans) {
+      for (std::size_t r = s.start; r < s.start + s.count; ++r) {
+        normalize_row_backward(x.data() + r * Dim, d_out.data() + r * Dim,
+                               dx.data() + r * Dim);
+      }
     }
     return dx;
   }

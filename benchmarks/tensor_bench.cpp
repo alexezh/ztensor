@@ -2,6 +2,7 @@
 // the matrix logic: the numbers here are the only reason to prefer one loop
 // over another.
 #include <chrono>
+#include <memory>
 #include <cstdio>
 #include <random>
 #include <string>
@@ -195,6 +196,48 @@ int main() {
       volatile float v = block.backward(d_out, &d_memory)(0, 0);
       (void)v;
     });
+  }
+
+  // --- batching: the ZAction decoder shape, 64 examples per SGD step ---
+  //
+  // 4 levels, 4 heads, 12 queries over 12 memory tokens, d 32, FFN 64.
+  // "one at a time" is 64 forward+backward passes of a Batch=1 decoder;
+  // "one batch" is a single pass of the same decoder with Batch=64.
+  std::printf("\nZAction decoder, 64 examples (4 levels, 12 q x 12 mem, d 32)\n");
+  {
+    constexpr std::size_t kQ = 12, kM = 12, kB = 64;
+    zf::TransformerDecoder<float, kQ, kM, kDim, kFf> one(4, 4);
+    one.randomize(rng);
+    zf::Tensor<float, kQ, kDim> x;
+    zf::Tensor<float, kM, kDim> memory;
+    zf::Tensor<float, kQ, kDim> d_out;
+    fill(x, rng);
+    fill(memory, rng);
+    fill(d_out, rng);
+    const double t1 = time_ms("one at a time (64 x Batch=1)", 50, [&] {
+      for (std::size_t b = 0; b < kB; ++b) {
+        one.forward(x, memory);
+        zf::Tensor<float, kM, kDim> d_memory;
+        volatile float v = one.backward(d_out, &d_memory)(0, 0);
+        (void)v;
+      }
+    });
+
+    auto batched = std::make_unique<zf::TransformerDecoder<float, kQ, kM, kDim, kFf, kB>>(4, 4);
+    batched->randomize(rng);
+    zf::Tensor<float, kB * kQ, kDim> xb;
+    zf::Tensor<float, kB * kM, kDim> memb;
+    zf::Tensor<float, kB * kQ, kDim> d_outb;
+    fill(xb, rng);
+    fill(memb, rng);
+    fill(d_outb, rng);
+    const double t2 = time_ms("one batch (Batch=64)", 50, [&] {
+      batched->forward(xb, memb);
+      zf::Tensor<float, kB * kM, kDim> d_memory;
+      volatile float v = batched->backward(d_outb, &d_memory)(0, 0);
+      (void)v;
+    });
+    std::printf("  batch speedup %.2fx\n", t1 / t2);
   }
   return 0;
 }

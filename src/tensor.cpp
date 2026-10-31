@@ -1,5 +1,7 @@
 #include "tensor.h"
 
+#include <stdexcept>
+
 namespace zf {
 
 void throw_index_out_of_range(std::size_t axis, std::size_t index,
@@ -25,6 +27,10 @@ std::string shape_to_string(const std::size_t* dims, std::size_t rank) {
   }
   out += "]";
   return out;
+}
+
+void throw_not_finite(const char* what) {
+  throw std::runtime_error(std::string("non-finite value after ") + what);
 }
 
 // Instantiate a few common shapes so this translation unit type-checks them.

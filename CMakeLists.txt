@@ -7,6 +7,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(ZTENSOR_BUILD_TESTS "Build unit tests (needs GTest)" ON)
+# Off by default: the binary then runs only on CPUs like the build machine.
+# Matters on x86, where the baseline is SSE2; arm64's baseline already has NEON.
+option(ZTENSOR_CHECK_FINITE "Throw on NaN/Inf after every block (debug)" OFF)
+option(ZTENSOR_NATIVE "Compile for the build machine's CPU (-march=native)" OFF)
 
 set(ZTENSOR_WARNINGS
   $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic>
@@ -29,6 +33,19 @@ target_include_directories(ztensor PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
 )
 target_compile_options(ztensor PRIVATE ${ZTENSOR_WARNINGS})
+if(ZTENSOR_CHECK_FINITE)
+  target_compile_definitions(ztensor PUBLIC ZTENSOR_CHECK_FINITE)
+endif()
+if(ZTENSOR_NATIVE)
+  # PUBLIC: the kernels are templates, compiled in the user's translation units.
+  include(CheckCXXCompilerFlag)
+  check_cxx_compiler_flag(-march=native ZTENSOR_HAS_MARCH_NATIVE)
+  if(ZTENSOR_HAS_MARCH_NATIVE)
+    target_compile_options(ztensor PUBLIC -march=native)
+  elseif(MSVC)
+    target_compile_options(ztensor PUBLIC /arch:AVX2)
+  endif()
+endif()
 
 # The README example.
 add_executable(find_symbol examples/find_symbol.cpp)
@@ -48,6 +65,7 @@ if(ZTENSOR_BUILD_TESTS)
     tests/softmax_exp_test.cpp
     tests/query_model_test.cpp
     tests/loss_test.cpp
+    tests/batch_test.cpp
   )
   target_include_directories(ztensor_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   target_link_libraries(ztensor_tests PRIVATE ztensor GTest::gtest_main)

@@ -1,16 +1,21 @@
 #pragma once
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
 #include <initializer_list>
+#include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 // Non-aliasing hint for the arithmetic kernels. The tensors a kernel reads and
 // the ones it writes are always distinct objects, but a compiler cannot prove
-// that through two pointers into two std::vectors, so without this it must
+// that through two raw pointers, so without this it must
 // reload after every store and cannot vectorize. Only used where the
 // no-overlap precondition is stated in the kernel's comment.
 #if defined(__clang__) || defined(__GNUC__)
@@ -61,9 +66,80 @@ using accumulator_t = typename accumulator<T>::type;
 [[noreturn]] void throw_bad_element_count(std::size_t given,
                                           std::size_t expected);
 
-// Fixed-shape, row-major tensor for small sizes. The element type and every
-// extent are template parameters, so the shape is known at compile time; the
-// elements live in a single std::vector.
+// A run of real rows inside a padded, row-stacked tensor: rows [start,
+// start + count). A batch of B padded sequences of length L is one tensor of
+// B * L rows, and example b's real rows are the span {b * L, valid_b}. Layers
+// that work row by row take a list of spans and touch only those rows.
+struct RowSpan {
+  std::size_t start = 0;
+  std::size_t count = 0;
+};
+using RowSpans = std::span<const RowSpan>;
+
+// Tensors up to this many bytes keep their elements inline, inside the object;
+// bigger ones hold one heap block. Inline storage makes a temporary free -- no
+// malloc/free per forward() -- and the shapes these models use are well under
+// it. The cap keeps a stack frame holding a few temporaries reasonable.
+inline constexpr std::size_t kInlineTensorBytes = 16 * 1024;
+
+namespace detail {
+
+// Contiguous, 64-byte aligned, zero-initialised storage for N elements.
+template <typename T, std::size_t N, bool Inline = (N * sizeof(T) <= kInlineTensorBytes)>
+class TensorStorage;
+
+template <typename T, std::size_t N>
+class TensorStorage<T, N, true> {
+ public:
+  T* data() { return data_; }
+  const T* data() const { return data_; }
+
+ private:
+  alignas(64) T data_[N] = {};
+};
+
+// One heap block, allocated when the tensor is constructed and never again.
+// Copies copy elements into the existing block; a move steals the block, and
+// the moved-from tensor gets a fresh zeroed one, so it stays usable.
+template <typename T, std::size_t N>
+class TensorStorage<T, N, false> {
+ public:
+  TensorStorage() : data_(allocate()) {}
+  TensorStorage(const TensorStorage& o) : data_(allocate()) {
+    std::copy(o.data(), o.data() + N, data());
+  }
+  TensorStorage(TensorStorage&& o) noexcept : data_(std::move(o.data_)) {
+    o.data_ = allocate();
+  }
+  TensorStorage& operator=(const TensorStorage& o) {
+    if (this != &o) std::copy(o.data(), o.data() + N, data());
+    return *this;
+  }
+  TensorStorage& operator=(TensorStorage&& o) noexcept {
+    data_.swap(o.data_);
+    return *this;
+  }
+
+  T* data() { return data_.get(); }
+  const T* data() const { return data_.get(); }
+
+ private:
+  struct Free {
+    void operator()(T* p) const { ::operator delete[](p, std::align_val_t{64}); }
+  };
+  static std::unique_ptr<T[], Free> allocate() {
+    T* p = static_cast<T*>(::operator new[](N * sizeof(T), std::align_val_t{64}));
+    std::fill(p, p + N, T{});
+    return std::unique_ptr<T[], Free>(p);
+  }
+  std::unique_ptr<T[], Free> data_;
+};
+
+}  // namespace detail
+
+// Fixed-shape, row-major tensor. The element type and every extent are
+// template parameters, so the shape is known at compile time; the elements are
+// one contiguous, 64-byte aligned block (see kInlineTensorBytes).
 template <typename T, std::size_t... Dims>
 class Tensor {
   static_assert(sizeof...(Dims) > 0, "tensor needs at least one dimension");
@@ -72,28 +148,25 @@ class Tensor {
  public:
   using value_type = T;
   using accum_type = accumulator_t<T>;
-  using iterator = typename std::vector<T>::iterator;
-  using const_iterator = typename std::vector<T>::const_iterator;
+  using iterator = T*;
+  using const_iterator = const T*;
 
   static constexpr std::size_t rank = sizeof...(Dims);
   static constexpr std::size_t element_count = (std::size_t{1} * ... * Dims);
   static constexpr std::array<std::size_t, rank> shape = {Dims...};
 
   // Zero-filled.
-  Tensor() : data_(element_count, T{}) {}
+  Tensor() = default;
 
   // Every element set to `value`.
-  explicit Tensor(T value) : data_(element_count, value) {}
+  explicit Tensor(T value) { fill(value); }
 
   // Row-major list of all elements.
-  Tensor(std::initializer_list<T> values) : data_(element_count, T{}) {
+  Tensor(std::initializer_list<T> values) {
     if (values.size() != element_count) {
       throw_bad_element_count(values.size(), element_count);
     }
-    std::size_t i = 0;
-    for (T v : values) {
-      data_[i++] = v;
-    }
+    std::copy(values.begin(), values.end(), begin());
   }
 
   static constexpr std::size_t size() { return element_count; }
@@ -110,47 +183,43 @@ class Tensor {
 
   template <typename... Idx>
   T& operator()(Idx... idx) {
-    return data_[flat_index(idx...)];
+    return data()[flat_index(idx...)];
   }
 
   template <typename... Idx>
   const T& operator()(Idx... idx) const {
-    return data_[flat_index(idx...)];
+    return data()[flat_index(idx...)];
   }
 
   // --- multi-dimensional access (bounds-checked) ---
 
   template <typename... Idx>
   T& at(Idx... idx) {
-    return data_[checked_flat_index(idx...)];
+    return data()[checked_flat_index(idx...)];
   }
 
   template <typename... Idx>
   const T& at(Idx... idx) const {
-    return data_[checked_flat_index(idx...)];
+    return data()[checked_flat_index(idx...)];
   }
 
   // --- flat access ---
 
-  T& operator[](std::size_t i) { return data_[i]; }
-  const T& operator[](std::size_t i) const { return data_[i]; }
+  T& operator[](std::size_t i) { return data()[i]; }
+  const T& operator[](std::size_t i) const { return data()[i]; }
 
   T* data() { return data_.data(); }
   const T* data() const { return data_.data(); }
 
-  iterator begin() { return data_.begin(); }
-  iterator end() { return data_.end(); }
-  const_iterator begin() const { return data_.begin(); }
-  const_iterator end() const { return data_.end(); }
+  iterator begin() { return data(); }
+  iterator end() { return data() + element_count; }
+  const_iterator begin() const { return data(); }
+  const_iterator end() const { return data() + element_count; }
 
-  void fill(T value) {
-    for (T& v : data_) {
-      v = value;
-    }
-  }
+  void fill(T value) { std::fill(begin(), end(), value); }
 
   friend bool operator==(const Tensor& a, const Tensor& b) {
-    return a.data_ == b.data_;
+    return std::equal(a.begin(), a.end(), b.begin());
   }
   friend bool operator!=(const Tensor& a, const Tensor& b) {
     return !(a == b);
@@ -199,7 +268,7 @@ class Tensor {
 
   static constexpr std::array<std::size_t, rank> strides_ = make_strides();
 
-  std::vector<T> data_;
+  detail::TensorStorage<T, element_count> data_;
 };
 
 // "[2, 3]" — handy in assertions and error messages.
@@ -209,6 +278,34 @@ template <typename T, std::size_t... Dims>
 std::string shape_to_string(const Tensor<T, Dims...>& t) {
   return shape_to_string(t.shape.data(), t.rank);
 }
+
+// True when no element is NaN or infinite.
+template <typename T, std::size_t... Dims>
+bool all_finite(const Tensor<T, Dims...>& t) {
+  if constexpr (std::is_floating_point_v<T>) {
+    for (const T v : t) {
+      if (!std::isfinite(v)) return false;
+    }
+  }
+  return true;
+}
+
+[[noreturn]] void throw_not_finite(const char* what);
+
+// Debug check after each major step: with ZTENSOR_CHECK_FINITE defined (the
+// CMake option of the same name), a NaN or infinity in `t` throws
+// std::runtime_error naming `what`, at the step that produced it instead of
+// several layers later. Compiles to nothing otherwise.
+#if defined(ZTENSOR_CHECK_FINITE)
+#define ZF_CHECK_FINITE(t, what)                  \
+  do {                                            \
+    if (!::zf::all_finite(t)) ::zf::throw_not_finite(what); \
+  } while (0)
+#else
+#define ZF_CHECK_FINITE(t, what) \
+  do {                           \
+  } while (0)
+#endif
 
 template <std::size_t... Dims>
 using TensorF = Tensor<float, Dims...>;
