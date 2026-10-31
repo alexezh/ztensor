@@ -63,7 +63,7 @@ class FeedForward {
     fc2_.backward_spans(h_, d_out, dh, spans_);
     for (const RowSpan& s : spans_) {
       for (std::size_t i = s.start * FfHidden; i < (s.start + s.count) * FfHidden; ++i) {
-        dh[i] *= dact_[i];
+        dh[i] = static_cast<T>(dh[i] * dact_[i]);
       }
     }
     Sequence dx;
@@ -76,7 +76,7 @@ class FeedForward {
     fc2_.zero_grad();
   }
 
-  void apply_sgd(T lr) {
+  void apply_sgd(accumulator_t<T> lr) {
     fc1_.apply_sgd(lr);
     fc2_.apply_sgd(lr);
   }
@@ -108,7 +108,7 @@ template <typename T, std::size_t SeqLen, std::size_t ModelDim,
           std::size_t FfHidden, Activation Act = Activation::kGelu,
           std::size_t Batch = 1>
 class TransformerBlock {
-  static_assert(std::is_floating_point_v<T>,
+  static_assert(is_real_v<T>,
                 "trainable models require a floating point element type");
 
  public:
@@ -178,7 +178,7 @@ class TransformerBlock {
     ln2_.zero_grad();
   }
 
-  void apply_sgd(T lr) {
+  void apply_sgd(accumulator_t<T> lr) {
     attn_.apply_sgd(lr);
     ff_.apply_sgd(lr);
     ln1_.apply_sgd(lr);
@@ -209,7 +209,7 @@ template <typename T, std::size_t SeqLen, std::size_t ModelDim,
           std::size_t FfHidden, Activation Act = Activation::kGelu,
           std::size_t Batch = 1>
 class Transformer {
-  static_assert(std::is_floating_point_v<T>,
+  static_assert(is_real_v<T>,
                 "trainable models require a floating point element type");
 
  public:
@@ -288,7 +288,7 @@ class Transformer {
     ln_f_.zero_grad();
   }
 
-  void apply_sgd(T lr) {
+  void apply_sgd(accumulator_t<T> lr) {
     for (Block& b : blocks_) {
       b.apply_sgd(lr);
     }

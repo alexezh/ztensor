@@ -79,6 +79,7 @@ if(ZTENSOR_BUILD_TESTS)
     tests/query_model_test.cpp
     tests/loss_test.cpp
     tests/batch_test.cpp
+    tests/bf16_test.cpp
   )
   target_include_directories(ztensor_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   target_link_libraries(ztensor_tests PRIVATE ztensor GTest::gtest_main)

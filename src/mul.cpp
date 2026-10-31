@@ -17,4 +17,7 @@ template TensorI8<2, 2> matmul(const TensorI8<2, 2>&, const TensorI8<2, 2>&);
 template Tensor<std::int32_t, 2, 2> matmul_wide(const TensorI8<2, 2>&,
                                                 const TensorI8<2, 2>&);
 
+template TensorB<3, 3> mul(const TensorB<3, 3>&, const TensorB<3, 3>&);
+template TensorB<4, 4> matmul(const TensorB<4, 4>&, const TensorB<4, 4>&);
+
 }  // namespace zf

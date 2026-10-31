@@ -20,22 +20,23 @@ namespace zf {
 // Mean squared error over the prediction, averaged across all elements.
 template <typename T, std::size_t... Dims>
 class MseLoss {
-  static_assert(std::is_floating_point_v<T>,
+  static_assert(is_real_v<T>,
                 "losses require a floating point element type");
 
  public:
   using value_type = T;
+  using Acc = accumulator_t<T>;  // the loss itself is in the math type
   using Prediction = Tensor<T, Dims...>;
 
-  T forward(const Prediction& pred, const Prediction& target) {
-    T sum{};
+  Acc forward(const Prediction& pred, const Prediction& target) {
+    Acc sum{};
     for (std::size_t i = 0; i < pred.size(); ++i) {
-      const T d = pred[i] - target[i];
-      d_pred_[i] = static_cast<T>(2) * d / static_cast<T>(pred.size());
+      const Acc d = pred[i] - target[i];
+      d_pred_[i] = static_cast<T>(static_cast<Acc>(2) * d / static_cast<Acc>(pred.size()));
       sum += d * d;
     }
     ready_ = true;
-    return sum / static_cast<T>(pred.size());
+    return sum / static_cast<Acc>(pred.size());
   }
 
   const Prediction& backward() const {
@@ -54,18 +55,19 @@ class MseLoss {
 // The softmax is fused into the loss, so the gradient is just p - onehot.
 template <typename T, std::size_t NumClasses>
 class SoftmaxCrossEntropyLoss {
-  static_assert(std::is_floating_point_v<T>,
+  static_assert(is_real_v<T>,
                 "losses require a floating point element type");
   static_assert(NumClasses > 1, "cross entropy needs at least two classes");
 
  public:
   using value_type = T;
+  using Acc = accumulator_t<T>;
   using Logits = Tensor<T, NumClasses>;
 
   static constexpr std::size_t num_classes = NumClasses;
 
   // Throws std::out_of_range when `label` is not a valid class index.
-  T forward(const Logits& logits, std::size_t label) {
+  Acc forward(const Logits& logits, std::size_t label) {
     if (label >= NumClasses) {
       throw std::out_of_range("class label " + std::to_string(label) +
                               " outside [0, " + std::to_string(NumClasses) +
@@ -77,11 +79,11 @@ class SoftmaxCrossEntropyLoss {
     for (std::size_t i = 0; i < NumClasses; ++i) {
       d_logits_(i) = probs_(i);
     }
-    d_logits_(label) -= T{1};
+    d_logits_(label) = static_cast<T>(d_logits_(label) - Acc{1});
     ready_ = true;
 
-    const T p = probs_(label);
-    const T floor = std::numeric_limits<T>::min();
+    const Acc p = probs_(label);
+    const Acc floor = std::numeric_limits<Acc>::min();
     return -std::log(p > floor ? p : floor);
   }
 
@@ -121,26 +123,27 @@ class SoftmaxCrossEntropyLoss {
 // document tower.
 template <typename T, std::size_t EmbedDim>
 class InfoNceLoss {
-  static_assert(std::is_floating_point_v<T>,
+  static_assert(is_real_v<T>,
                 "losses require a floating point element type");
 
  public:
   using value_type = T;
+  using Acc = accumulator_t<T>;
   using Vector = Tensor<T, EmbedDim>;
 
   static constexpr std::size_t embed_dim = EmbedDim;
 
-  explicit InfoNceLoss(T temperature = static_cast<T>(1))
+  explicit InfoNceLoss(Acc temperature = static_cast<Acc>(1))
       : temperature_(temperature) {
-    if (!(temperature > T{0})) {
+    if (!(temperature > Acc{0})) {
       throw std::invalid_argument("temperature must be positive");
     }
   }
 
-  T temperature() const { return temperature_; }
+  Acc temperature() const { return temperature_; }
 
   // `candidates[positive]` is the matching document; the rest are negatives.
-  T forward(const Vector& query, const std::vector<Vector>& candidates,
+  Acc forward(const Vector& query, const std::vector<Vector>& candidates,
             std::size_t positive) {
     if (candidates.empty()) {
       throw std::invalid_argument("InfoNCE needs at least one candidate");
@@ -151,18 +154,18 @@ class InfoNceLoss {
                               std::to_string(candidates.size()) + ")");
     }
 
-    const T inv_tau = T{1} / temperature_;
+    const Acc inv_tau = Acc{1} / temperature_;
     const std::size_t n = candidates.size();
 
-    probs_.assign(n, T{});
-    T max_v = -std::numeric_limits<T>::infinity();
+    probs_.assign(n, Acc{});
+    Acc max_v = -std::numeric_limits<Acc>::infinity();
     for (std::size_t i = 0; i < n; ++i) {
       probs_[i] = dot(query, candidates[i]) * inv_tau;
       if (probs_[i] > max_v) {
         max_v = probs_[i];
       }
     }
-    T sum{};
+    Acc sum{};
     for (std::size_t i = 0; i < n; ++i) {
       probs_[i] = std::exp(probs_[i] - max_v);
       sum += probs_[i];
@@ -172,19 +175,22 @@ class InfoNceLoss {
     }
 
     // d(loss)/d(logit_i) = p_i - 1{i == positive}, then chain through the dot
-    d_query_ = Vector{};
+    Acc d_query[EmbedDim] = {};
     d_candidates_.assign(n, Vector{});
     for (std::size_t i = 0; i < n; ++i) {
-      const T g = (probs_[i] - (i == positive ? T{1} : T{0})) * inv_tau;
+      const Acc g = (probs_[i] - (i == positive ? Acc{1} : Acc{0})) * inv_tau;
       for (std::size_t d = 0; d < EmbedDim; ++d) {
-        d_query_(d) += g * candidates[i](d);
-        d_candidates_[i](d) = g * query(d);
+        d_query[d] += g * candidates[i](d);
+        d_candidates_[i](d) = static_cast<T>(g * query(d));
       }
+    }
+    for (std::size_t d = 0; d < EmbedDim; ++d) {
+      d_query_(d) = static_cast<T>(d_query[d]);
     }
     ready_ = true;
 
-    const T p = probs_[positive];
-    const T floor = std::numeric_limits<T>::min();
+    const Acc p = probs_[positive];
+    const Acc floor = std::numeric_limits<Acc>::min();
     return -std::log(p > floor ? p : floor);
   }
 
@@ -203,7 +209,7 @@ class InfoNceLoss {
   }
 
   // Softmax over candidates from the last forward().
-  const std::vector<T>& probabilities() const { return probs_; }
+  const std::vector<Acc>& probabilities() const { return probs_; }
 
   std::size_t argmax() const {
     std::size_t best = 0;
@@ -216,9 +222,9 @@ class InfoNceLoss {
   }
 
  private:
-  T temperature_;
+  Acc temperature_;
 
-  std::vector<T> probs_;
+  std::vector<Acc> probs_;
   Vector d_query_;
   std::vector<Vector> d_candidates_;
   bool ready_ = false;

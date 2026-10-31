@@ -113,8 +113,41 @@ decoder.apply_sgd(lr / 64);             // one step for the whole batch
 Tests check that a batch gives the same outputs and gradients as running its
 examples one at a time.
 
-Batching does not make a single thread faster at these sizes. Time per example
-is flat from a batch size of 1 to 64, because small layers already run in
-4-row blocks. Batching is there so gradients can be averaged over many
-examples and a later multi-threaded trainer can split a batch across cores.
+Without Accelerate, batching doesn't make a single thread faster at these
+sizes. Small layers already run in 4-row blocks, so time per example stays
+flat from a batch size of 1 to 64. With Accelerate (the default on Apple), the
+batch's projections become tall matrix multiplies and a 64-example step runs
+about 1.4x faster. Batching also lets you average gradients over many examples,
+and a later multi-threaded trainer could split a batch across cores.
+
+## bf16
+
+Every layer, model and loss takes its element type as the first template
+parameter. Both `float` and `zf::bf16` work:
+
+```cpp
+zf::TransformerDecoder<zf::bf16, Q, M, D, F> decoder(4, 4);
+zf::Tensor<zf::bf16, Q, D> x = zf::tensor_cast<zf::bf16>(x_float);
+auto y = decoder.forward(x, memory);    // y is bf16 too
+decoder.apply_sgd(0.02f);               // learning rate stays float
+```
+
+`bf16` is a storage type. Weights, activations and the gradients passed
+between layers are 16 bits. All arithmetic runs in float
+(`zf::accumulator_t<bf16>`): sums, softmax and attention weights, layer-norm
+statistics, losses, and parameter gradients (`weight_grad()` returns a float
+tensor). A value is rounded to bf16, to nearest even, only where it is
+stored. Reading a `bf16` gives a `float` implicitly. Writing one is explicit
+(`bf16(x)` or `static_cast<T>(x)`), and `bf16` has no arithmetic operators of
+its own, so every rounding point in the code is visible.
+
+Accuracy: a bf16 model matches the same model in float to within about 1% per
+layer and a few percent through a stack. Trained end to end in bf16, the
+pointing example above reaches 100% accuracy, the same as float.
+
+Speed: there's no bf16 arithmetic on the CPU without the BF16 instructions,
+so bf16 is for memory, not time. A 48-row `Linear` is about 1.5x slower than
+float, mostly the cost of rounding its output. A 64-example decoder step is
+about 1.2x slower. Stacks of 8 or more rows widen the weights to float once
+and run the float kernels, and tall stacks go through Accelerate.
 

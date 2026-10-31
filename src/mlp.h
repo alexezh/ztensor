@@ -17,7 +17,7 @@ namespace zf {
 template <typename T, std::size_t InDim, std::size_t HiddenDim,
           std::size_t OutDim>
 class Mlp {
-  static_assert(std::is_floating_point_v<T>,
+  static_assert(is_real_v<T>,
                 "trainable models require a floating point element type");
 
  public:
@@ -60,7 +60,7 @@ class Mlp {
     const Hidden dh = fc2_.backward(h_, d_out);
     Hidden dh_pre;
     for (std::size_t i = 0; i < HiddenDim; ++i) {
-      dh_pre(i) = dh(i) * activation_grad(act_, h_pre_(i));
+      dh_pre(i) = static_cast<T>(dh(i) * activation_grad(act_, h_pre_(i)));
     }
     return fc1_.backward(x_, dh_pre);
   }
@@ -70,7 +70,7 @@ class Mlp {
     fc2_.zero_grad();
   }
 
-  void apply_sgd(T lr) {
+  void apply_sgd(accumulator_t<T> lr) {
     fc1_.apply_sgd(lr);
     fc2_.apply_sgd(lr);
   }

@@ -16,26 +16,30 @@ namespace zf {
 //
 // Pointers are to one head's slice of a row; consecutive rows are ModelDim
 // apart. Keys and values are the `limit` rows starting at k / v.
+//
+// q, k, v and the context are stored as T. Scores, attention weights and
+// every gradient that accumulates across rows (dq, dk, dv) are in the math
+// type Acc -- float for both float and bf16.
 
 // arow[j] = (q . k_j) * scale for j < limit. Four keys at a time against one
 // query slice, for the same reason Linear does four outputs at once: the query
 // stays in registers and four independent accumulators keep the pipeline fed.
-template <std::size_t ModelDim, typename T>
+template <std::size_t ModelDim, typename T, typename Acc = accumulator_t<T>>
 ZF_ALWAYS_INLINE void score_row(const T* ZF_RESTRICT q, const T* ZF_RESTRICT k,
-                                std::size_t limit, std::size_t hd, T scale,
-                                T* ZF_RESTRICT arow) {
+                                std::size_t limit, std::size_t hd, Acc scale,
+                                Acc* ZF_RESTRICT arow) {
   std::size_t j = 0;
   for (; j + 4 <= limit; j += 4) {
     const T* ZF_RESTRICT k0 = k + (j + 0) * ModelDim;
     const T* ZF_RESTRICT k1 = k + (j + 1) * ModelDim;
     const T* ZF_RESTRICT k2 = k + (j + 2) * ModelDim;
     const T* ZF_RESTRICT k3 = k + (j + 3) * ModelDim;
-    T s0{};
-    T s1{};
-    T s2{};
-    T s3{};
+    Acc s0{};
+    Acc s1{};
+    Acc s2{};
+    Acc s3{};
     for (std::size_t d = 0; d < hd; ++d) {
-      const T qv = q[d];
+      const Acc qv = q[d];
       s0 += k0[d] * qv;
       s1 += k1[d] * qv;
       s2 += k2[d] * qv;
@@ -48,27 +52,53 @@ ZF_ALWAYS_INLINE void score_row(const T* ZF_RESTRICT q, const T* ZF_RESTRICT k,
   }
   for (; j < limit; ++j) {
     const T* ZF_RESTRICT kj = k + j * ModelDim;
-    T sum{};
+    Acc sum{};
     for (std::size_t d = 0; d < hd; ++d) sum += kj[d] * q[d];
     arow[j] = sum * scale;
+  }
+}
+
+// ci = sum_m arow[m] * v_m over `limit` rows; ci is zero on entry.
+// Accumulated over keys rather than one output dimension at a time: the inner
+// loop then walks a row of V contiguously and has no reduction in it at all.
+// For float the sum builds in ci itself; a storage type sums in a float row
+// and rounds once at the end.
+template <std::size_t ModelDim, typename T, typename Acc = accumulator_t<T>>
+ZF_ALWAYS_INLINE void context_row(const Acc* ZF_RESTRICT arow,
+                                  const T* ZF_RESTRICT v, std::size_t limit,
+                                  std::size_t hd, T* ZF_RESTRICT ci) {
+  if constexpr (std::is_same_v<T, Acc>) {
+    for (std::size_t m = 0; m < limit; ++m) {
+      const Acc weight = arow[m];
+      const T* ZF_RESTRICT vm = v + m * ModelDim;
+      for (std::size_t d = 0; d < hd; ++d) ci[d] += weight * vm[d];
+    }
+  } else {
+    Acc acc[ModelDim] = {};
+    for (std::size_t m = 0; m < limit; ++m) {
+      const Acc weight = arow[m];
+      const T* ZF_RESTRICT vm = v + m * ModelDim;
+      for (std::size_t d = 0; d < hd; ++d) acc[d] += weight * vm[d];
+    }
+    for (std::size_t d = 0; d < hd; ++d) ci[d] = static_cast<T>(acc[d]);
   }
 }
 
 // Backward of one query row of one head: given its weights `arow` and the
 // context gradient `g`, adds into dq (this row), dk and dv (the key rows).
 // `dap` is scratch of at least `limit`.
-template <std::size_t ModelDim, typename T>
+template <std::size_t ModelDim, typename T, typename Acc = accumulator_t<T>>
 ZF_ALWAYS_INLINE void attend_backward(
-    const T* ZF_RESTRICT arow, const T* ZF_RESTRICT g, const T* ZF_RESTRICT q,
+    const Acc* ZF_RESTRICT arow, const T* ZF_RESTRICT g, const T* ZF_RESTRICT q,
     const T* ZF_RESTRICT k, const T* ZF_RESTRICT v, std::size_t limit,
-    std::size_t hd, T scale, T* ZF_RESTRICT dap, T* ZF_RESTRICT dq,
-    T* ZF_RESTRICT dk, T* ZF_RESTRICT dv) {
+    std::size_t hd, Acc scale, Acc* ZF_RESTRICT dap, Acc* ZF_RESTRICT dq,
+    Acc* ZF_RESTRICT dk, Acc* ZF_RESTRICT dv) {
   // dL/d(attention weights), and the value gradient they feed.
   for (std::size_t j = 0; j < limit; ++j) {
     const T* ZF_RESTRICT vj = v + j * ModelDim;
-    T* ZF_RESTRICT dvj = dv + j * ModelDim;
-    const T weight = arow[j];
-    T acc{};
+    Acc* ZF_RESTRICT dvj = dv + j * ModelDim;
+    const Acc weight = arow[j];
+    Acc acc{};
     for (std::size_t d = 0; d < hd; ++d) {
       acc += g[d] * vj[d];
       dvj[d] += weight * g[d];
@@ -76,12 +106,12 @@ ZF_ALWAYS_INLINE void attend_backward(
     dap[j] = acc;
   }
   // softmax jacobian: ds_j = p_j * (dp_j - sum_m p_m dp_m)
-  T dot_pd{};
+  Acc dot_pd{};
   for (std::size_t j = 0; j < limit; ++j) dot_pd += arow[j] * dap[j];
   for (std::size_t j = 0; j < limit; ++j) {
-    const T ds = arow[j] * (dap[j] - dot_pd) * scale;
+    const Acc ds = arow[j] * (dap[j] - dot_pd) * scale;
     const T* ZF_RESTRICT kj = k + j * ModelDim;
-    T* ZF_RESTRICT dkj = dk + j * ModelDim;
+    Acc* ZF_RESTRICT dkj = dk + j * ModelDim;
     for (std::size_t d = 0; d < hd; ++d) {
       dq[d] += ds * kj[d];
       dkj[d] += ds * q[d];
@@ -115,16 +145,20 @@ ZF_ALWAYS_INLINE void attend_backward(
 template <typename T, std::size_t SeqLen, std::size_t ModelDim,
           std::size_t Batch = 1>
 class MultiHeadSelfAttention {
-  static_assert(std::is_floating_point_v<T>,
+  static_assert(is_real_v<T>,
                 "trainable layers require a floating point element type");
   static_assert(Batch > 0, "a batch holds at least one example");
 
  public:
   using value_type = T;
+  using Acc = accumulator_t<T>;
   static constexpr std::size_t kRows = Batch * SeqLen;
   using Sequence = Tensor<T, kRows, ModelDim>;
   // Row = query row (all examples stacked), column = key within its example.
-  using Scores = Tensor<T, kRows, SeqLen>;
+  // Weights are kept in the math type: they are summed against, and a
+  // softmax row rounded to bf16 no longer sums to one.
+  using Scores = Tensor<Acc, kRows, SeqLen>;
+  using AccSequence = Tensor<Acc, kRows, ModelDim>;
 
   static constexpr std::size_t seq_len = SeqLen;
   static constexpr std::size_t model_dim = ModelDim;
@@ -182,7 +216,7 @@ class MultiHeadSelfAttention {
   // query's output is never looked at -- and they receive no gradient.
   Sequence forward(const Sequence& x) {
     const std::size_t hd = head_dim();
-    const T inv_scale = T{1} / std::sqrt(static_cast<T>(hd));
+    const Acc inv_scale = Acc{1} / std::sqrt(static_cast<Acc>(hd));
 
     x_ = x;
     q_.fill(T{});
@@ -200,7 +234,7 @@ class MultiHeadSelfAttention {
 
     for (std::size_t h = 0; h < heads_; ++h) {
       const std::size_t off = h * hd;
-      T* ZF_RESTRICT ap = attn_[h].data();
+      Acc* ZF_RESTRICT ap = attn_[h].data();
       for (std::size_t b = 0; b < Batch; ++b) {
         const std::size_t base = b * SeqLen;
         const std::size_t valid = spans_[b].count;
@@ -209,24 +243,17 @@ class MultiHeadSelfAttention {
         for (std::size_t i = 0; i < valid; ++i) {
           const std::size_t limit = key_limit(i, valid);
           const T* ZF_RESTRICT qi = qp + (base + i) * ModelDim + off;
-          T* ZF_RESTRICT arow = ap + (base + i) * SeqLen;
+          Acc* ZF_RESTRICT arow = ap + (base + i) * SeqLen;
           score_row<ModelDim>(qi, kb, limit, hd, inv_scale, arow);
           softmax_inplace(arow, limit);
-          for (std::size_t m = limit; m < SeqLen; ++m) arow[m] = T{};
-          // Context, accumulated over keys rather than one output dimension
-          // at a time: the inner loop then walks a row of V contiguously and
-          // has no reduction in it at all.
-          T* ZF_RESTRICT ci = cp + (base + i) * ModelDim + off;
-          for (std::size_t m = 0; m < limit; ++m) {
-            const T weight = arow[m];
-            const T* ZF_RESTRICT vm = vb + m * ModelDim;
-            for (std::size_t d = 0; d < hd; ++d) ci[d] += weight * vm[d];
-          }
+          for (std::size_t m = limit; m < SeqLen; ++m) arow[m] = Acc{};
+          context_row<ModelDim>(arow, vb, limit, hd,
+                                cp + (base + i) * ModelDim + off);
         }
         // A padded query has no weights.
         for (std::size_t i = valid; i < SeqLen; ++i) {
-          T* ZF_RESTRICT arow = ap + (base + i) * SeqLen;
-          for (std::size_t m = 0; m < SeqLen; ++m) arow[m] = T{};
+          Acc* ZF_RESTRICT arow = ap + (base + i) * SeqLen;
+          for (std::size_t m = 0; m < SeqLen; ++m) arow[m] = Acc{};
         }
       }
     }
@@ -238,29 +265,29 @@ class MultiHeadSelfAttention {
   // Returns dL/dx. Must follow a matching forward().
   Sequence backward(const Sequence& d_out) {
     const std::size_t hd = head_dim();
-    const T inv_scale = T{1} / std::sqrt(static_cast<T>(hd));
+    const Acc inv_scale = Acc{1} / std::sqrt(static_cast<Acc>(hd));
 
     Sequence d_ctx;
     wo_.backward_spans(ctx_, d_out, d_ctx, spans_);
 
-    Sequence dq;
-    Sequence dk;
-    Sequence dv;
+    AccSequence dq;
+    AccSequence dk;
+    AccSequence dv;
     const T* ZF_RESTRICT qp = q_.data();
     const T* ZF_RESTRICT kp = k_.data();
     const T* ZF_RESTRICT vp = v_.data();
     const T* ZF_RESTRICT gp = d_ctx.data();
-    T* ZF_RESTRICT dqp = dq.data();
-    T* ZF_RESTRICT dkp = dk.data();
-    T* ZF_RESTRICT dvp = dv.data();
+    Acc* ZF_RESTRICT dqp = dq.data();
+    Acc* ZF_RESTRICT dkp = dk.data();
+    Acc* ZF_RESTRICT dvp = dv.data();
 
     // Scratch for one row of attention-weight gradient.
-    Tensor<T, SeqLen> d_attn;
-    T* ZF_RESTRICT dap = d_attn.data();
+    Tensor<Acc, SeqLen> d_attn;
+    Acc* ZF_RESTRICT dap = d_attn.data();
 
     for (std::size_t h = 0; h < heads_; ++h) {
       const std::size_t off = h * hd;
-      const T* ZF_RESTRICT ap = attn_[h].data();
+      const Acc* ZF_RESTRICT ap = attn_[h].data();
       for (std::size_t b = 0; b < Batch; ++b) {
         const std::size_t base = b * SeqLen;
         const std::size_t valid = spans_[b].count;
@@ -277,9 +304,9 @@ class MultiHeadSelfAttention {
     }
 
     Sequence dx;
-    wq_.backward_spans(x_, dq, dx, spans_);
-    wk_.backward_spans(x_, dk, dx, spans_);
-    wv_.backward_spans(x_, dv, dx, spans_);
+    wq_.backward_spans(x_, as_tensor_of<T>(dq), dx, spans_);
+    wk_.backward_spans(x_, as_tensor_of<T>(dk), dx, spans_);
+    wv_.backward_spans(x_, as_tensor_of<T>(dv), dx, spans_);
     return dx;
   }
 
@@ -290,7 +317,7 @@ class MultiHeadSelfAttention {
     wo_.zero_grad();
   }
 
-  void apply_sgd(T lr) {
+  void apply_sgd(Acc lr) {
     wq_.apply_sgd(lr);
     wk_.apply_sgd(lr);
     wv_.apply_sgd(lr);

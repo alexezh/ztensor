@@ -37,8 +37,9 @@ double time_ms(const char* what, std::size_t reps, Body&& body) {
 template <typename Tensor>
 void fill(Tensor& t, std::mt19937& rng) {
   std::normal_distribution<float> dist(0.0f, 0.5f);
+  using T = typename Tensor::value_type;
   for (std::size_t i = 0; i < t.size(); ++i) {
-    t.data()[i] = dist(rng);
+    t.data()[i] = static_cast<T>(dist(rng));
   }
 }
 
@@ -202,6 +203,38 @@ int main() {
       block.forward(x, memory);
       zf::Tensor<float, kSeq, kDim> d_memory;
       volatile float v = block.backward(d_out, &d_memory)(0, 0);
+      (void)v;
+    });
+  }
+
+  // --- bf16: the same shapes with bf16 storage and float math ---
+  std::printf("\nbf16\n");
+  {
+    zf::Linear<zf::bf16, kDim, kDim> layer;
+    layer.randomize(rng);
+    zf::Tensor<zf::bf16, kSeq, kDim> x;
+    zf::Tensor<zf::bf16, kSeq, kDim> d_out;
+    fill(x, rng);
+    fill(d_out, rng);
+    time_ms("Linear<32,32> forward, 48 rows", 20000, [&] {
+      volatile float v = layer.template forward<kSeq>(x)(0, 0);
+      (void)v;
+    });
+    time_ms("Linear<32,32> backward, 48 rows", 20000, [&] {
+      volatile float v = layer.template backward<kSeq>(x, d_out)(0, 0);
+      (void)v;
+    });
+  }
+  {
+    zf::TransformerBlock<zf::bf16, kSeq, kDim, kFf> block(4);
+    block.randomize(rng);
+    zf::Tensor<zf::bf16, kSeq, kDim> x;
+    zf::Tensor<zf::bf16, kSeq, kDim> d_out;
+    fill(x, rng);
+    fill(d_out, rng);
+    time_ms("TransformerBlock forward+backward", 2000, [&] {
+      block.forward(x);
+      volatile float v = block.backward(d_out)(0, 0);
       (void)v;
     });
   }

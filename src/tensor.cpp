@@ -42,4 +42,7 @@ template class Tensor<std::int8_t, 3>;
 template class Tensor<std::int8_t, 2, 2>;
 template class Tensor<std::int8_t, 3, 3>;
 
+template class Tensor<bf16, 3>;
+template class Tensor<bf16, 4, 4>;
+
 }  // namespace zf

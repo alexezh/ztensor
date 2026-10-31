@@ -36,19 +36,20 @@ namespace zf {
 template <typename T, std::size_t QueryLen, std::size_t MemoryLen,
           std::size_t ModelDim, std::size_t Batch = 1>
 class MultiHeadCrossAttention {
-  static_assert(std::is_floating_point_v<T>,
+  static_assert(is_real_v<T>,
                 "trainable layers require a floating point element type");
   static_assert(Batch > 0, "a batch holds at least one example");
 
  public:
   using value_type = T;
+  using Acc = accumulator_t<T>;
   static constexpr std::size_t kQueryRows = Batch * QueryLen;
   static constexpr std::size_t kMemoryRows = Batch * MemoryLen;
   using QuerySequence = Tensor<T, kQueryRows, ModelDim>;
   using MemorySequence = Tensor<T, kMemoryRows, ModelDim>;
   // Row = query row (all examples stacked), column = memory slot within its
-  // example.
-  using Scores = Tensor<T, kQueryRows, MemoryLen>;
+  // example. In the math type, as in MultiHeadSelfAttention.
+  using Scores = Tensor<Acc, kQueryRows, MemoryLen>;
 
   static constexpr std::size_t query_len = QueryLen;
   static constexpr std::size_t memory_len = MemoryLen;
@@ -117,7 +118,7 @@ class MultiHeadCrossAttention {
   QuerySequence forward(const QuerySequence& q_in,
                         const MemorySequence& memory) {
     const std::size_t hd = head_dim();
-    const T inv_scale = T{1} / std::sqrt(static_cast<T>(hd));
+    const Acc inv_scale = Acc{1} / std::sqrt(static_cast<Acc>(hd));
 
     q_in_ = q_in;
     memory_ = memory;
@@ -138,7 +139,7 @@ class MultiHeadCrossAttention {
 
     for (std::size_t h = 0; h < heads_; ++h) {
       const std::size_t off = h * hd;
-      T* ZF_RESTRICT ap = attn_[h].data();
+      Acc* ZF_RESTRICT ap = attn_[h].data();
       for (std::size_t b = 0; b < Batch; ++b) {
         const std::size_t qbase = b * QueryLen;
         const std::size_t valid = query_spans_[b].count;
@@ -147,21 +148,17 @@ class MultiHeadCrossAttention {
         const T* ZF_RESTRICT vb = vp + b * MemoryLen * ModelDim + off;
         for (std::size_t i = 0; i < valid; ++i) {
           const T* ZF_RESTRICT qi = qp + (qbase + i) * ModelDim + off;
-          T* ZF_RESTRICT arow = ap + (qbase + i) * MemoryLen;
+          Acc* ZF_RESTRICT arow = ap + (qbase + i) * MemoryLen;
           score_row<ModelDim>(qi, kb, limit, hd, inv_scale, arow);
           softmax_inplace(arow, limit);
-          for (std::size_t m = limit; m < MemoryLen; ++m) arow[m] = T{};
+          for (std::size_t m = limit; m < MemoryLen; ++m) arow[m] = Acc{};
           // Context over memory rows, each read contiguously.
-          T* ZF_RESTRICT ci = cp + (qbase + i) * ModelDim + off;
-          for (std::size_t m = 0; m < limit; ++m) {
-            const T weight = arow[m];
-            const T* ZF_RESTRICT vm = vb + m * ModelDim;
-            for (std::size_t d = 0; d < hd; ++d) ci[d] += weight * vm[d];
-          }
+          context_row<ModelDim>(arow, vb, limit, hd,
+                                cp + (qbase + i) * ModelDim + off);
         }
         for (std::size_t i = valid; i < QueryLen; ++i) {
-          T* ZF_RESTRICT arow = ap + (qbase + i) * MemoryLen;
-          for (std::size_t m = 0; m < MemoryLen; ++m) arow[m] = T{};
+          Acc* ZF_RESTRICT arow = ap + (qbase + i) * MemoryLen;
+          for (std::size_t m = 0; m < MemoryLen; ++m) arow[m] = Acc{};
         }
       }
     }
@@ -176,27 +173,27 @@ class MultiHeadCrossAttention {
   QuerySequence backward(const QuerySequence& d_out,
                          MemorySequence* d_memory) {
     const std::size_t hd = head_dim();
-    const T inv_scale = T{1} / std::sqrt(static_cast<T>(hd));
+    const Acc inv_scale = Acc{1} / std::sqrt(static_cast<Acc>(hd));
 
     QuerySequence d_ctx;
     wo_.backward_spans(ctx_, d_out, d_ctx, query_spans_);
 
-    QuerySequence dq;
-    MemorySequence dk;
-    MemorySequence dv;
+    Tensor<Acc, kQueryRows, ModelDim> dq;
+    Tensor<Acc, kMemoryRows, ModelDim> dk;
+    Tensor<Acc, kMemoryRows, ModelDim> dv;
     const T* ZF_RESTRICT qp = q_.data();
     const T* ZF_RESTRICT kp = k_.data();
     const T* ZF_RESTRICT vp = v_.data();
     const T* ZF_RESTRICT gp = d_ctx.data();
-    T* ZF_RESTRICT dqp = dq.data();
-    T* ZF_RESTRICT dkp = dk.data();
-    T* ZF_RESTRICT dvp = dv.data();
-    Tensor<T, MemoryLen> d_attn;
-    T* ZF_RESTRICT dap = d_attn.data();
+    Acc* ZF_RESTRICT dqp = dq.data();
+    Acc* ZF_RESTRICT dkp = dk.data();
+    Acc* ZF_RESTRICT dvp = dv.data();
+    Tensor<Acc, MemoryLen> d_attn;
+    Acc* ZF_RESTRICT dap = d_attn.data();
 
     for (std::size_t h = 0; h < heads_; ++h) {
       const std::size_t off = h * hd;
-      const T* ZF_RESTRICT ap = attn_[h].data();
+      const Acc* ZF_RESTRICT ap = attn_[h].data();
       for (std::size_t b = 0; b < Batch; ++b) {
         const std::size_t valid = query_spans_[b].count;
         const std::size_t limit = memory_spans_[b].count;
@@ -212,11 +209,11 @@ class MultiHeadCrossAttention {
     }
 
     if (d_memory != nullptr) {
-      wk_.backward_spans(memory_, dk, *d_memory, memory_spans_);
-      wv_.backward_spans(memory_, dv, *d_memory, memory_spans_);
+      wk_.backward_spans(memory_, as_tensor_of<T>(dk), *d_memory, memory_spans_);
+      wv_.backward_spans(memory_, as_tensor_of<T>(dv), *d_memory, memory_spans_);
     }
     QuerySequence dx;
-    wq_.backward_spans(q_in_, dq, dx, query_spans_);
+    wq_.backward_spans(q_in_, as_tensor_of<T>(dq), dx, query_spans_);
     return dx;
   }
 
@@ -227,7 +224,7 @@ class MultiHeadCrossAttention {
     wo_.zero_grad();
   }
 
-  void apply_sgd(T lr) {
+  void apply_sgd(Acc lr) {
     wq_.apply_sgd(lr);
     wk_.apply_sgd(lr);
     wv_.apply_sgd(lr);
@@ -346,7 +343,7 @@ class DecoderBlock {
     ln3_.zero_grad();
   }
 
-  void apply_sgd(T lr) {
+  void apply_sgd(accumulator_t<T> lr) {
     self_.apply_sgd(lr);
     cross_.apply_sgd(lr);
     ff_.apply_sgd(lr);
@@ -463,7 +460,7 @@ class TransformerDecoder {
     out_norm_.zero_grad();
   }
 
-  void apply_sgd(T lr) {
+  void apply_sgd(accumulator_t<T> lr) {
     for (Block& block : blocks_) {
       block.apply_sgd(lr);
     }

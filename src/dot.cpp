@@ -13,4 +13,6 @@ template std::int32_t dot(const TensorI8<3>&, const TensorI8<3>&);
 template std::int32_t dot(const TensorI8<2, 2>&, const TensorI8<2, 2>&);
 template std::int32_t squared_norm(const TensorI8<3>&);
 
+template float dot(const TensorB<4>&, const TensorB<4>&);
+
 }  // namespace zf

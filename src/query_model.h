@@ -28,11 +28,12 @@ namespace zf {
 template <typename T, std::size_t VocabSize, std::size_t EmbedDim,
           std::size_t HiddenDim, std::size_t OutDim>
 class QueryModel {
-  static_assert(std::is_floating_point_v<T>,
+  static_assert(is_real_v<T>,
                 "trainable models require a floating point element type");
 
  public:
   using value_type = T;
+  using Acc = accumulator_t<T>;
   using Embedded = Tensor<T, EmbedDim>;
   using Output = Tensor<T, OutDim>;
 
@@ -66,16 +67,16 @@ class QueryModel {
     }
     tokens_ = token_ids;
 
-    pooled_ = Embedded{};
+    Acc pooled[EmbedDim] = {};
     for (std::size_t id : token_ids) {
       const Embedded e = embed_.forward(id);
       for (std::size_t i = 0; i < EmbedDim; ++i) {
-        pooled_(i) += e(i);
+        pooled[i] += e(i);
       }
     }
-    const T inv_n = T{1} / static_cast<T>(token_ids.size());
+    const Acc inv_n = Acc{1} / static_cast<Acc>(token_ids.size());
     for (std::size_t i = 0; i < EmbedDim; ++i) {
-      pooled_(i) *= inv_n;
+      pooled_(i) = static_cast<T>(pooled[i] * inv_n);
     }
 
     pre_norm_ = proj_.forward(pooled_);
@@ -84,14 +85,14 @@ class QueryModel {
       return out_;
     }
 
-    T sq{};
+    Acc sq{};
     for (std::size_t i = 0; i < OutDim; ++i) {
       sq += pre_norm_(i) * pre_norm_(i);
     }
-    inv_norm_ = T{1} / std::sqrt(sq + eps_);
+    inv_norm_ = Acc{1} / std::sqrt(sq + eps_);
     out_ = Output{};
     for (std::size_t i = 0; i < OutDim; ++i) {
-      out_(i) = pre_norm_(i) * inv_norm_;
+      out_(i) = static_cast<T>(pre_norm_(i) * inv_norm_);
     }
     return out_;
   }
@@ -107,22 +108,22 @@ class QueryModel {
     Output d_pre = d_out;
     if (normalize_) {
       // y = x / ||x||  =>  dx = (dy - y (y . dy)) / ||x||
-      T proj{};
+      Acc proj{};
       for (std::size_t i = 0; i < OutDim; ++i) {
         proj += out_(i) * d_out(i);
       }
       for (std::size_t i = 0; i < OutDim; ++i) {
-        d_pre(i) = (d_out(i) - out_(i) * proj) * inv_norm_;
+        d_pre(i) = static_cast<T>((d_out(i) - out_(i) * proj) * inv_norm_);
       }
     }
 
     const Embedded d_pooled = proj_.backward(d_pre);
 
     // mean pooling spreads the gradient evenly over the tokens
-    const T inv_n = T{1} / static_cast<T>(tokens_.size());
+    const Acc inv_n = Acc{1} / static_cast<Acc>(tokens_.size());
     Embedded d_token;
     for (std::size_t i = 0; i < EmbedDim; ++i) {
-      d_token(i) = d_pooled(i) * inv_n;
+      d_token(i) = static_cast<T>(d_pooled(i) * inv_n);
     }
     for (std::size_t id : tokens_) {
       embed_.backward(id, d_token);
@@ -130,14 +131,14 @@ class QueryModel {
   }
 
   // Cosine similarity when both towers normalize, plain dot product otherwise.
-  static T score(const Output& a, const Output& b) { return dot(a, b); }
+  static Acc score(const Output& a, const Output& b) { return dot(a, b); }
 
   void zero_grad() {
     embed_.zero_grad();
     proj_.zero_grad();
   }
 
-  void apply_sgd(T lr) {
+  void apply_sgd(Acc lr) {
     embed_.apply_sgd(lr);
     proj_.apply_sgd(lr);
   }
@@ -156,14 +157,14 @@ class QueryModel {
   Embedding<T, VocabSize, EmbedDim> embed_;
   Mlp<T, EmbedDim, HiddenDim, OutDim> proj_;
   bool normalize_;
-  T eps_ = static_cast<T>(1e-12);
+  Acc eps_ = static_cast<Acc>(1e-12);
 
   // activations cached by forward() for use by backward()
   std::vector<std::size_t> tokens_;
   Embedded pooled_;
   Output pre_norm_;
   Output out_;
-  T inv_norm_ = T{1};
+  Acc inv_norm_ = Acc{1};
 };
 
 }  // namespace zf

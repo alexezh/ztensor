@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <random>
 #include <type_traits>
+#include <vector>
 
 #include "blas.h"
 #include "tensor.h"
@@ -120,6 +121,21 @@ T activation_apply_with_grad(Activation act, T x, T* grad) {
   return activate_with_grad<Activation::kIdentity>(x, grad);
 }
 
+// bf16: the same functions evaluated in float, rounded once on the way out.
+inline bf16 activation_apply(Activation act, bf16 x) {
+  return bf16(activation_apply(act, static_cast<float>(x)));
+}
+inline bf16 activation_grad(Activation act, bf16 x) {
+  return bf16(activation_grad(act, static_cast<float>(x)));
+}
+template <Activation Act>
+ZF_ALWAYS_INLINE bf16 activate_with_grad(bf16 x, bf16* grad) {
+  float g;
+  const float y = activate_with_grad<Act>(static_cast<float>(x), &g);
+  *grad = bf16(g);
+  return bf16(y);
+}
+
 // y = W x + b, with W stored as [OutDim, InDim].
 // A 4-wide SIMD value for the kernels: NEON / SSE registers through the
 // compiler's vector extension, plain arrays elsewhere.
@@ -148,10 +164,26 @@ struct Vec4 {
 };
 #endif
 
+// Four elements into a vector of the math type: a plain load for float, a
+// widening load for bf16 (each lane's 16 bits shifted to the top of a float,
+// which is exact and one instruction on NEON and SSE).
 template <typename T>
-ZF_ALWAYS_INLINE Vec4<T> load4(const T* p) {
-  Vec4<T> v;
-  std::memcpy(&v, p, sizeof(v));
+ZF_ALWAYS_INLINE Vec4<accumulator_t<T>> load4(const T* p) {
+  Vec4<accumulator_t<T>> v;
+  if constexpr (std::is_same_v<T, bf16>) {
+#if defined(__clang__) || defined(__GNUC__)
+    using U16x4 = std::uint16_t __attribute__((vector_size(8)));
+    using U32x4 = std::uint32_t __attribute__((vector_size(16)));
+    U16x4 h;
+    std::memcpy(&h, p, sizeof(h));
+    const U32x4 w = __builtin_convertvector(h, U32x4) << 16;
+    std::memcpy(&v, &w, sizeof(v));
+#else
+    for (std::size_t i = 0; i < 4; ++i) v[i] = static_cast<float>(p[i]);
+#endif
+  } else {
+    std::memcpy(&v, p, sizeof(v));
+  }
   return v;
 }
 
@@ -165,15 +197,48 @@ ZF_ALWAYS_INLINE T hsum4(const Vec4<T>& v) {
   return (v[0] + v[1]) + (v[2] + v[3]);
 }
 
+// n elements of T into the math type, and back with rounding. Plain loops:
+// both vectorize (widening is a shift, rounding an add and a shift).
+template <typename T>
+inline void widen_into(const T* ZF_RESTRICT src, accumulator_t<T>* ZF_RESTRICT dst,
+                       std::size_t n) {
+  for (std::size_t i = 0; i < n; ++i) dst[i] = static_cast<accumulator_t<T>>(src[i]);
+}
+
+template <typename T>
+inline void narrow_into(const accumulator_t<T>* ZF_RESTRICT src, T* ZF_RESTRICT dst,
+                        std::size_t n) {
+  for (std::size_t i = 0; i < n; ++i) dst[i] = static_cast<T>(src[i]);
+}
+
+namespace detail {
+
+// A per-thread float buffer of at least n elements; `slot` keeps the buffers
+// one call needs at the same time apart. Grows, never shrinks.
+template <typename A>
+inline A* widen_scratch(std::size_t slot, std::size_t n) {
+  thread_local std::vector<A> buffers[4];
+  std::vector<A>& b = buffers[slot];
+  if (b.size() < n) b.resize(n);
+  return b.data();
+}
+
+}  // namespace detail
+
 template <typename T, std::size_t InDim, std::size_t OutDim>
 class Linear {
-  static_assert(std::is_floating_point_v<T>,
+  static_assert(is_real_v<T>,
                 "trainable layers require a floating point element type");
 
  public:
   using value_type = T;
+  // The math type: float for both float and bf16. Parameters are stored as
+  // T; their gradients, which accumulate over every row of a batch, as Acc.
+  using Acc = accumulator_t<T>;
   using WeightTensor = Tensor<T, OutDim, InDim>;
   using BiasTensor = Tensor<T, OutDim>;
+  using WeightGradTensor = Tensor<Acc, OutDim, InDim>;
+  using BiasGradTensor = Tensor<Acc, OutDim>;
 
   static constexpr std::size_t in_dim = InDim;
   static constexpr std::size_t out_dim = OutDim;
@@ -230,20 +295,24 @@ class Linear {
   // accumulate row by row in order, so the 4-row backward matches the
   // one-row backward exactly.
   //
+  // With bf16 storage the loads widen to float and every sum is in float; only
+  // the stored outputs and dx are rounded to bf16.
+  //
   // `benchmarks/tensor_bench.cpp` is where these claims are checked.
   static constexpr std::size_t kLanes = 4;
   static constexpr std::size_t kBlock = 4;     // outputs per block
   static constexpr std::size_t kRowBlock = 4;  // input rows per block
   static constexpr std::size_t kVecIn = InDim / kLanes * kLanes;
   static constexpr std::size_t kVecOut = OutDim / kBlock * kBlock;
-  using V = Vec4<T>;
+  using V = Vec4<Acc>;
 
   // out[r * OutDim + o] = b + W x_r for R rows starting at x. `out` must not
-  // overlap anything else.
-  template <std::size_t R>
-  ZF_ALWAYS_INLINE void matmul_rows(const T* ZF_RESTRICT x,
+  // overlap anything else. `w` is W itself or a float copy of it, and x is
+  // T or float: the bf16 paths widen once and reuse the float kernel.
+  template <std::size_t R, typename W, typename X>
+  ZF_ALWAYS_INLINE void matmul_rows(const W* ZF_RESTRICT w,
+                                    const X* ZF_RESTRICT x,
                                     T* ZF_RESTRICT out) const {
-    const T* ZF_RESTRICT w = w_.data();
     for (std::size_t o = 0; o < kVecOut; o += kBlock) {
       V acc[R][kBlock] = {};
       for (std::size_t i = 0; i < kVecIn; i += kLanes) {
@@ -256,23 +325,24 @@ class Linear {
       }
       for (std::size_t r = 0; r < R; ++r) {
         for (std::size_t c = 0; c < kBlock; ++c) {
-          T sum = hsum4(acc[r][c]);
+          Acc sum = hsum4(acc[r][c]);
           // The widths are compile-time constants, so when they divide evenly
           // the leftover loops are not emitted at all.
           if constexpr (InDim % kLanes != 0) {
-            const T* ZF_RESTRICT wo = w + (o + c) * InDim;
+            const W* ZF_RESTRICT wo = w + (o + c) * InDim;
             for (std::size_t i = kVecIn; i < InDim; ++i) {
               sum += wo[i] * x[r * InDim + i];
             }
           }
-          out[r * OutDim + o + c] = b_(o + c) + sum;
+          out[r * OutDim + o + c] = static_cast<T>(static_cast<Acc>(b_(o + c)) + sum);
         }
       }
     }
     if constexpr (OutDim % kBlock != 0) {
       for (std::size_t r = 0; r < R; ++r) {
         for (std::size_t o = kVecOut; o < OutDim; ++o) {
-          out[r * OutDim + o] = b_(o) + dot_row(w + o * InDim, x + r * InDim);
+          out[r * OutDim + o] = static_cast<T>(
+              static_cast<Acc>(b_(o)) + dot_row(w + o * InDim, x + r * InDim));
         }
       }
     }
@@ -281,15 +351,15 @@ class Linear {
   // For R rows: accumulates dW and db, and adds each row's dx into `dx`.
   // dx is built in a local block and added once at the end, so the inner
   // loop's read-modify-write stays in registers and L1.
-  template <std::size_t R>
-  ZF_ALWAYS_INLINE void matmul_rows_backward(const T* ZF_RESTRICT x,
-                                             const T* ZF_RESTRICT g,
+  template <std::size_t R, typename W, typename X, typename G>
+  ZF_ALWAYS_INLINE void matmul_rows_backward(const W* ZF_RESTRICT w,
+                                             const X* ZF_RESTRICT x,
+                                             const G* ZF_RESTRICT g,
                                              T* ZF_RESTRICT dx) {
-    const T* ZF_RESTRICT w = w_.data();
-    T* ZF_RESTRICT dw = dw_.data();
-    alignas(16) T local[R][InDim] = {};
+    Acc* ZF_RESTRICT dw = dw_.data();
+    alignas(16) Acc local[R][InDim] = {};
     for (std::size_t o = 0; o < kVecOut; o += kBlock) {
-      T gr[R][kBlock];
+      Acc gr[R][kBlock];
       for (std::size_t c = 0; c < kBlock; ++c) {
         for (std::size_t r = 0; r < R; ++r) {
           gr[r][c] = g[r * OutDim + o + c];
@@ -331,10 +401,10 @@ class Linear {
     }
     if constexpr (OutDim % kBlock != 0) {
       for (std::size_t o = kVecOut; o < OutDim; ++o) {
-        T* ZF_RESTRICT dwo = dw + o * InDim;
-        const T* ZF_RESTRICT wo = w + o * InDim;
+        Acc* ZF_RESTRICT dwo = dw + o * InDim;
+        const W* ZF_RESTRICT wo = w + o * InDim;
         for (std::size_t r = 0; r < R; ++r) {
-          const T gv = g[r * OutDim + o];
+          const Acc gv = g[r * OutDim + o];
           db_(o) += gv;
           for (std::size_t i = 0; i < InDim; ++i) {
             dwo[i] += gv * x[r * InDim + i];
@@ -344,16 +414,20 @@ class Linear {
       }
     }
     for (std::size_t r = 0; r < R; ++r) {
-      for (std::size_t i = 0; i < InDim; ++i) dx[r * InDim + i] += local[r][i];
+      for (std::size_t i = 0; i < InDim; ++i) {
+        dx[r * InDim + i] =
+            static_cast<T>(static_cast<Acc>(dx[r * InDim + i]) + local[r][i]);
+      }
     }
   }
 
   // Plain dot product over InDim with the kernels' summation order. Used for
   // the leftover outputs when OutDim is not a multiple of the block.
-  static T dot_row(const T* ZF_RESTRICT a, const T* ZF_RESTRICT b) {
+  template <typename A, typename B>
+  static Acc dot_row(const A* ZF_RESTRICT a, const B* ZF_RESTRICT b) {
     V acc{};
     for (std::size_t i = 0; i < kVecIn; i += kLanes) acc += load4(a + i) * load4(b + i);
-    T sum = hsum4(acc);
+    Acc sum = hsum4(acc);
     for (std::size_t i = kVecIn; i < InDim; ++i) sum += a[i] * b[i];
     return sum;
   }
@@ -362,14 +436,14 @@ class Linear {
 
   Tensor<T, OutDim> forward(const Tensor<T, InDim>& x) const {
     Tensor<T, OutDim> out;
-    matmul_rows<1>(x.data(), out.data());
+    matmul_rows<1>(w_.data(), x.data(), out.data());
     return out;
   }
 
   Tensor<T, InDim> backward(const Tensor<T, InDim>& x,
                             const Tensor<T, OutDim>& d_out) {
     Tensor<T, InDim> dx;
-    matmul_rows_backward<1>(x.data(), d_out.data(), dx.data());
+    matmul_rows_backward<1>(w_.data(), x.data(), d_out.data(), dx.data());
     return dx;
   }
 
@@ -404,7 +478,15 @@ class Linear {
   // to SGEMM instead (see blas.h for why the bar is that high). SGEMM sums in
   // its own order, so on that path a row's result can differ in the last bits
   // from the same row computed alone.
+  //
+  // bf16 stacks of at least kWidenMinRows rows widen W to float once per call,
+  // and each block of rows once, and then run the float kernels (or SGEMM):
+  // otherwise every weight would be widened again for every block of rows.
+  // Widening is exact and the float kernels sum in the same order, so this
+  // changes no result, only the time. Shorter stacks widen as they load.
   static constexpr bool kUseBlas = blas::kEnabled && std::is_same_v<T, float>;
+  static constexpr bool kStorageType = !std::is_same_v<T, Acc>;
+  static constexpr std::size_t kWidenMinRows = 8;
 
   void forward_into(const T* x, T* out, std::size_t rows) const {
     if constexpr (kUseBlas) {
@@ -413,11 +495,17 @@ class Linear {
         return;
       }
     }
+    if constexpr (kStorageType) {
+      if (rows >= kWidenMinRows) {
+        forward_widened(x, out, rows);
+        return;
+      }
+    }
     std::size_t r = 0;
     for (; r + kRowBlock <= rows; r += kRowBlock) {
-      matmul_rows<kRowBlock>(x + r * InDim, out + r * OutDim);
+      matmul_rows<kRowBlock>(w_.data(), x + r * InDim, out + r * OutDim);
     }
-    for (; r < rows; ++r) matmul_rows<1>(x + r * InDim, out + r * OutDim);
+    for (; r < rows; ++r) matmul_rows<1>(w_.data(), x + r * InDim, out + r * OutDim);
   }
 
   // Span forms over a row-stacked tensor: only rows inside `spans` are
@@ -469,27 +557,90 @@ class Linear {
         return;
       }
     }
+    if constexpr (kStorageType) {
+      if (rows >= kWidenMinRows) {
+        backward_widened(x, d_out, dx, rows);
+        return;
+      }
+    }
     std::size_t r = 0;
     for (; r + kRowBlock <= rows; r += kRowBlock) {
-      matmul_rows_backward<kRowBlock>(x + r * InDim, d_out + r * OutDim,
+      matmul_rows_backward<kRowBlock>(w_.data(), x + r * InDim, d_out + r * OutDim,
                                       dx + r * InDim);
     }
     for (; r < rows; ++r) {
-      matmul_rows_backward<1>(x + r * InDim, d_out + r * OutDim, dx + r * InDim);
+      matmul_rows_backward<1>(w_.data(), x + r * InDim, d_out + r * OutDim,
+                              dx + r * InDim);
+    }
+  }
+
+  // The bf16 paths described at forward_into. Scratch is per thread and
+  // reused, so a call allocates nothing once warmed up.
+  void forward_widened(const T* x, T* out, std::size_t rows) const {
+    Acc* wf = detail::widen_scratch<Acc>(0, OutDim * InDim);
+    widen_into(w_.data(), wf, OutDim * InDim);
+    if constexpr (blas::kEnabled) {
+      if (rows >= blas::kMinRows) {
+        Acc* xf = detail::widen_scratch<Acc>(1, rows * InDim);
+        Acc* bf = detail::widen_scratch<Acc>(2, OutDim);
+        Acc* of = detail::widen_scratch<Acc>(3, rows * OutDim);
+        widen_into(x, xf, rows * InDim);
+        widen_into(b_.data(), bf, OutDim);
+        blas::linear_forward(xf, wf, bf, of, rows, InDim, OutDim);
+        narrow_into(of, out, rows * OutDim);
+        return;
+      }
+    }
+    Acc* xb = detail::widen_scratch<Acc>(1, kRowBlock * InDim);
+    std::size_t r = 0;
+    for (; r + kRowBlock <= rows; r += kRowBlock) {
+      widen_into(x + r * InDim, xb, kRowBlock * InDim);
+      matmul_rows<kRowBlock>(wf, xb, out + r * OutDim);
+    }
+    for (; r < rows; ++r) matmul_rows<1>(wf, x + r * InDim, out + r * OutDim);
+  }
+
+  void backward_widened(const T* x, const T* d_out, T* dx, std::size_t rows) {
+    Acc* wf = detail::widen_scratch<Acc>(0, OutDim * InDim);
+    widen_into(w_.data(), wf, OutDim * InDim);
+    if constexpr (blas::kEnabled) {
+      if (rows >= blas::kMinRows) {
+        Acc* xf = detail::widen_scratch<Acc>(1, rows * InDim);
+        Acc* gf = detail::widen_scratch<Acc>(2, rows * OutDim);
+        Acc* dxf = detail::widen_scratch<Acc>(3, rows * InDim);
+        widen_into(x, xf, rows * InDim);
+        widen_into(d_out, gf, rows * OutDim);
+        widen_into(dx, dxf, rows * InDim);
+        blas::linear_backward(xf, gf, wf, dxf, dw_.data(), db_.data(), rows,
+                              InDim, OutDim);
+        narrow_into(dxf, dx, rows * InDim);
+        return;
+      }
+    }
+    Acc* xb = detail::widen_scratch<Acc>(1, kRowBlock * InDim);
+    Acc* gb = detail::widen_scratch<Acc>(2, kRowBlock * OutDim);
+    std::size_t r = 0;
+    for (; r + kRowBlock <= rows; r += kRowBlock) {
+      widen_into(x + r * InDim, xb, kRowBlock * InDim);
+      widen_into(d_out + r * OutDim, gb, kRowBlock * OutDim);
+      matmul_rows_backward<kRowBlock>(wf, xb, gb, dx + r * InDim);
+    }
+    for (; r < rows; ++r) {
+      matmul_rows_backward<1>(wf, x + r * InDim, d_out + r * OutDim, dx + r * InDim);
     }
   }
 
   void zero_grad() {
-    dw_.fill(T{});
-    db_.fill(T{});
+    dw_.fill(Acc{});
+    db_.fill(Acc{});
   }
 
-  void apply_sgd(T lr) {
+  void apply_sgd(Acc lr) {
     for (std::size_t i = 0; i < w_.size(); ++i) {
-      w_[i] -= lr * dw_[i];
+      w_[i] = static_cast<T>(static_cast<Acc>(w_[i]) - lr * dw_[i]);
     }
     for (std::size_t i = 0; i < b_.size(); ++i) {
-      b_[i] -= lr * db_[i];
+      b_[i] = static_cast<T>(static_cast<Acc>(b_[i]) - lr * db_[i]);
     }
   }
 
@@ -497,47 +648,48 @@ class Linear {
   const WeightTensor& weight() const { return w_; }
   BiasTensor& bias() { return b_; }
   const BiasTensor& bias() const { return b_; }
-  const WeightTensor& weight_grad() const { return dw_; }
-  const BiasTensor& bias_grad() const { return db_; }
+  const WeightGradTensor& weight_grad() const { return dw_; }
+  const BiasGradTensor& bias_grad() const { return db_; }
 
  private:
   WeightTensor w_;
   BiasTensor b_;
-  WeightTensor dw_;
-  BiasTensor db_;
+  WeightGradTensor dw_;
+  BiasGradTensor db_;
 };
 
 // Normalizes each row over its `Dim` features, then scales and shifts.
 template <typename T, std::size_t Dim>
 class LayerNorm {
-  static_assert(std::is_floating_point_v<T>,
+  static_assert(is_real_v<T>,
                 "trainable layers require a floating point element type");
 
  public:
   using value_type = T;
+  using Acc = accumulator_t<T>;  // statistics and gradients
   static constexpr std::size_t dim = Dim;
   static constexpr std::size_t parameter_count = 2 * Dim;
 
-  explicit LayerNorm(T eps = static_cast<T>(1e-5)) : eps_(eps) {
+  explicit LayerNorm(Acc eps = static_cast<Acc>(1e-5)) : eps_(eps) {
     gamma_.fill(T{1});
   }
 
   Tensor<T, Dim> forward(const Tensor<T, Dim>& x) const {
     Tensor<T, Dim> out;
-    T mean{};
+    Acc mean{};
     for (std::size_t i = 0; i < Dim; ++i) {
       mean += x(i);
     }
-    mean /= static_cast<T>(Dim);
-    T var{};
+    mean /= static_cast<Acc>(Dim);
+    Acc var{};
     for (std::size_t i = 0; i < Dim; ++i) {
-      const T c = x(i) - mean;
+      const Acc c = x(i) - mean;
       var += c * c;
     }
-    var /= static_cast<T>(Dim);
-    const T rstd = T{1} / std::sqrt(var + eps_);
+    var /= static_cast<Acc>(Dim);
+    const Acc rstd = Acc{1} / std::sqrt(var + eps_);
     for (std::size_t i = 0; i < Dim; ++i) {
-      out(i) = gamma_(i) * (x(i) - mean) * rstd + beta_(i);
+      out(i) = static_cast<T>(gamma_(i) * (x(i) - mean) * rstd + beta_(i));
     }
     return out;
   }
@@ -545,35 +697,35 @@ class LayerNorm {
   Tensor<T, Dim> backward(const Tensor<T, Dim>& x,
                           const Tensor<T, Dim>& d_out) {
     Tensor<T, Dim> dx;
-    T mean{};
+    Acc mean{};
     for (std::size_t i = 0; i < Dim; ++i) {
       mean += x(i);
     }
-    mean /= static_cast<T>(Dim);
-    T var{};
+    mean /= static_cast<Acc>(Dim);
+    Acc var{};
     for (std::size_t i = 0; i < Dim; ++i) {
-      const T c = x(i) - mean;
+      const Acc c = x(i) - mean;
       var += c * c;
     }
-    var /= static_cast<T>(Dim);
-    const T rstd = T{1} / std::sqrt(var + eps_);
+    var /= static_cast<Acc>(Dim);
+    const Acc rstd = Acc{1} / std::sqrt(var + eps_);
 
     // dy scaled by gamma, plus the two mean terms that normalization couples in
-    T sum_dg{};
-    T sum_dg_xhat{};
+    Acc sum_dg{};
+    Acc sum_dg_xhat{};
     for (std::size_t i = 0; i < Dim; ++i) {
-      const T xhat = (x(i) - mean) * rstd;
-      const T dg = d_out(i) * gamma_(i);
+      const Acc xhat = (x(i) - mean) * rstd;
+      const Acc dg = d_out(i) * gamma_(i);
       dgamma_(i) += d_out(i) * xhat;
       dbeta_(i) += d_out(i);
       sum_dg += dg;
       sum_dg_xhat += dg * xhat;
     }
-    const T inv_n = T{1} / static_cast<T>(Dim);
+    const Acc inv_n = Acc{1} / static_cast<Acc>(Dim);
     for (std::size_t i = 0; i < Dim; ++i) {
-      const T xhat = (x(i) - mean) * rstd;
-      const T dg = d_out(i) * gamma_(i);
-      dx(i) = rstd * (dg - inv_n * sum_dg - xhat * inv_n * sum_dg_xhat);
+      const Acc xhat = (x(i) - mean) * rstd;
+      const Acc dg = d_out(i) * gamma_(i);
+      dx(i) = static_cast<T>(rstd * (dg - inv_n * sum_dg - xhat * inv_n * sum_dg_xhat));
     }
     return dx;
   }
@@ -642,72 +794,72 @@ class LayerNorm {
   // One row, in place. Same arithmetic as the single-vector path above.
   ZF_ALWAYS_INLINE void normalize_row(const T* ZF_RESTRICT x,
                                       T* ZF_RESTRICT out) const {
-    T mean{};
+    Acc mean{};
     for (std::size_t i = 0; i < Dim; ++i) {
       mean += x[i];
     }
-    mean /= static_cast<T>(Dim);
-    T var{};
+    mean /= static_cast<Acc>(Dim);
+    Acc var{};
     for (std::size_t i = 0; i < Dim; ++i) {
-      const T c = x[i] - mean;
+      const Acc c = x[i] - mean;
       var += c * c;
     }
-    var /= static_cast<T>(Dim);
-    const T rstd = T{1} / std::sqrt(var + eps_);
+    var /= static_cast<Acc>(Dim);
+    const Acc rstd = Acc{1} / std::sqrt(var + eps_);
     const T* ZF_RESTRICT g = gamma_.data();
     const T* ZF_RESTRICT b = beta_.data();
     for (std::size_t i = 0; i < Dim; ++i) {
-      out[i] = g[i] * (x[i] - mean) * rstd + b[i];
+      out[i] = static_cast<T>(g[i] * (x[i] - mean) * rstd + b[i]);
     }
   }
 
   ZF_ALWAYS_INLINE void normalize_row_backward(const T* ZF_RESTRICT x,
                                               const T* ZF_RESTRICT d_out,
                                               T* ZF_RESTRICT dx) {
-    T mean{};
+    Acc mean{};
     for (std::size_t i = 0; i < Dim; ++i) {
       mean += x[i];
     }
-    mean /= static_cast<T>(Dim);
-    T var{};
+    mean /= static_cast<Acc>(Dim);
+    Acc var{};
     for (std::size_t i = 0; i < Dim; ++i) {
-      const T c = x[i] - mean;
+      const Acc c = x[i] - mean;
       var += c * c;
     }
-    var /= static_cast<T>(Dim);
-    const T rstd = T{1} / std::sqrt(var + eps_);
+    var /= static_cast<Acc>(Dim);
+    const Acc rstd = Acc{1} / std::sqrt(var + eps_);
 
     const T* ZF_RESTRICT g = gamma_.data();
-    T* ZF_RESTRICT dg = dgamma_.data();
-    T* ZF_RESTRICT db = dbeta_.data();
+    Acc* ZF_RESTRICT dg = dgamma_.data();
+    Acc* ZF_RESTRICT db = dbeta_.data();
     // dy scaled by gamma, plus the two mean terms normalization couples in
-    T sum_dg{};
-    T sum_dg_xhat{};
+    Acc sum_dg{};
+    Acc sum_dg_xhat{};
     for (std::size_t i = 0; i < Dim; ++i) {
-      const T xhat = (x[i] - mean) * rstd;
-      const T dgi = d_out[i] * g[i];
+      const Acc xhat = (x[i] - mean) * rstd;
+      const Acc dgi = d_out[i] * g[i];
       dg[i] += d_out[i] * xhat;
       db[i] += d_out[i];
       sum_dg += dgi;
       sum_dg_xhat += dgi * xhat;
     }
-    const T inv_n = T{1} / static_cast<T>(Dim);
+    const Acc inv_n = Acc{1} / static_cast<Acc>(Dim);
     for (std::size_t i = 0; i < Dim; ++i) {
-      const T xhat = (x[i] - mean) * rstd;
-      const T dgi = d_out[i] * g[i];
-      dx[i] = rstd * (dgi - inv_n * sum_dg - xhat * inv_n * sum_dg_xhat);
+      const Acc xhat = (x[i] - mean) * rstd;
+      const Acc dgi = d_out[i] * g[i];
+      dx[i] = static_cast<T>(rstd * (dgi - inv_n * sum_dg - xhat * inv_n * sum_dg_xhat));
     }
   }
 
   void zero_grad() {
-    dgamma_.fill(T{});
-    dbeta_.fill(T{});
+    dgamma_.fill(Acc{});
+    dbeta_.fill(Acc{});
   }
 
-  void apply_sgd(T lr) {
+  void apply_sgd(Acc lr) {
     for (std::size_t i = 0; i < Dim; ++i) {
-      gamma_(i) -= lr * dgamma_(i);
-      beta_(i) -= lr * dbeta_(i);
+      gamma_(i) = static_cast<T>(static_cast<Acc>(gamma_(i)) - lr * dgamma_(i));
+      beta_(i) = static_cast<T>(static_cast<Acc>(beta_(i)) - lr * dbeta_(i));
     }
   }
 
@@ -715,8 +867,8 @@ class LayerNorm {
   const Tensor<T, Dim>& gamma() const { return gamma_; }
   Tensor<T, Dim>& beta() { return beta_; }
   const Tensor<T, Dim>& beta() const { return beta_; }
-  const Tensor<T, Dim>& gamma_grad() const { return dgamma_; }
-  const Tensor<T, Dim>& beta_grad() const { return dbeta_; }
+  const Tensor<Acc, Dim>& gamma_grad() const { return dgamma_; }
+  const Tensor<Acc, Dim>& beta_grad() const { return dbeta_; }
 
  private:
   template <std::size_t Rows>
@@ -731,20 +883,22 @@ class LayerNorm {
 
   Tensor<T, Dim> gamma_;
   Tensor<T, Dim> beta_;
-  Tensor<T, Dim> dgamma_;
-  Tensor<T, Dim> dbeta_;
-  T eps_;
+  Tensor<Acc, Dim> dgamma_;
+  Tensor<Acc, Dim> dbeta_;
+  Acc eps_;
 };
 
 // Token id -> dense row. Gradients are scattered back per id.
 template <typename T, std::size_t VocabSize, std::size_t EmbedDim>
 class Embedding {
-  static_assert(std::is_floating_point_v<T>,
+  static_assert(is_real_v<T>,
                 "trainable layers require a floating point element type");
 
  public:
   using value_type = T;
+  using Acc = accumulator_t<T>;
   using WeightTensor = Tensor<T, VocabSize, EmbedDim>;
+  using WeightGradTensor = Tensor<Acc, VocabSize, EmbedDim>;
 
   static constexpr std::size_t vocab_size = VocabSize;
   static constexpr std::size_t embed_dim = EmbedDim;
@@ -776,21 +930,21 @@ class Embedding {
     }
   }
 
-  void zero_grad() { dw_.fill(T{}); }
+  void zero_grad() { dw_.fill(Acc{}); }
 
-  void apply_sgd(T lr) {
+  void apply_sgd(Acc lr) {
     for (std::size_t i = 0; i < w_.size(); ++i) {
-      w_[i] -= lr * dw_[i];
+      w_[i] = static_cast<T>(static_cast<Acc>(w_[i]) - lr * dw_[i]);
     }
   }
 
   WeightTensor& weight() { return w_; }
   const WeightTensor& weight() const { return w_; }
-  const WeightTensor& weight_grad() const { return dw_; }
+  const WeightGradTensor& weight_grad() const { return dw_; }
 
  private:
   WeightTensor w_;
-  WeightTensor dw_;
+  WeightGradTensor dw_;
 };
 
 // In-place softmax over `n` leading entries of `row`, max-shifted.
@@ -867,33 +1021,48 @@ inline T softmax_exp_for(T x) {
 
 template <typename T>
 void softmax_inplace(T* ZF_RESTRICT row, std::size_t n) {
-  T max_v = row[0];
-  for (std::size_t i = 1; i < n; ++i) {
-    if (row[i] > max_v) {
-      max_v = row[i];
+  if constexpr (!std::is_same_v<T, accumulator_t<T>>) {
+    // A storage type (bf16): rounding each exponential to 16 bits before
+    // summing would put that error into every weight. Sum in float, then
+    // exponentiate again for the stores -- the row has no float scratch.
+    using Acc = accumulator_t<T>;
+    Acc max_v = row[0];
+    for (std::size_t i = 1; i < n; ++i) max_v = row[i] > max_v ? Acc(row[i]) : max_v;
+    Acc sum{};
+    for (std::size_t i = 0; i < n; ++i) sum += softmax_exp_for(Acc(row[i]) - max_v);
+    const Acc inv = Acc{1} / sum;
+    for (std::size_t i = 0; i < n; ++i) {
+      row[i] = static_cast<T>(softmax_exp_for(Acc(row[i]) - max_v) * inv);
     }
-  }
-  // Exponentiate first, total afterwards. Accumulating the sum in the same
-  // loop as the stores puts a dependent add between consecutive elements and
-  // the loop will not vectorize; separated, the first loop is pure elementwise
-  // work and the second is a reduction with four independent accumulators.
-  for (std::size_t i = 0; i < n; ++i) {
-    row[i] = softmax_exp_for(row[i] - max_v);
-  }
-  T acc[4] = {};
-  std::size_t i = 0;
-  for (; i + 4 <= n; i += 4) {
-    for (std::size_t k = 0; k < 4; ++k) {
-      acc[k] += row[i + k];
+  } else {
+    T max_v = row[0];
+    for (std::size_t i = 1; i < n; ++i) {
+      if (row[i] > max_v) {
+        max_v = row[i];
+      }
     }
-  }
-  T sum = (acc[0] + acc[1]) + (acc[2] + acc[3]);
-  for (; i < n; ++i) {
-    sum += row[i];
-  }
-  const T inv = T{1} / sum;
-  for (std::size_t j = 0; j < n; ++j) {
-    row[j] *= inv;
+    // Exponentiate first, total afterwards. Accumulating the sum in the same
+    // loop as the stores puts a dependent add between consecutive elements and
+    // the loop will not vectorize; separated, the first loop is pure elementwise
+    // work and the second is a reduction with four independent accumulators.
+    for (std::size_t i = 0; i < n; ++i) {
+      row[i] = softmax_exp_for(row[i] - max_v);
+    }
+    T acc[4] = {};
+    std::size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+      for (std::size_t k = 0; k < 4; ++k) {
+        acc[k] += row[i + k];
+      }
+    }
+    T sum = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+    for (; i < n; ++i) {
+      sum += row[i];
+    }
+    const T inv = T{1} / sum;
+    for (std::size_t j = 0; j < n; ++j) {
+      row[j] *= inv;
+    }
   }
 }
 

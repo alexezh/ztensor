@@ -13,6 +13,8 @@
 #include <type_traits>
 #include <vector>
 
+#include "bf16.h"
+
 // Non-aliasing hint for the arithmetic kernels. The tensors a kernel reads and
 // the ones it writes are always distinct objects, but a compiler cannot prove
 // that through two raw pointers, so without this it must
@@ -39,6 +41,11 @@ namespace zf {
 template <typename T>
 struct accumulator {
   using type = T;
+};
+// bf16 is storage only: sums, and every intermediate in the layers, are float.
+template <>
+struct accumulator<bf16> {
+  using type = float;
 };
 template <>
 struct accumulator<std::int8_t> {
@@ -282,12 +289,35 @@ std::string shape_to_string(const Tensor<T, Dims...>& t) {
 // True when no element is NaN or infinite.
 template <typename T, std::size_t... Dims>
 bool all_finite(const Tensor<T, Dims...>& t) {
-  if constexpr (std::is_floating_point_v<T>) {
+  if constexpr (is_real_v<T>) {
     for (const T v : t) {
-      if (!std::isfinite(v)) return false;
+      if (!std::isfinite(static_cast<accumulator_t<T>>(v))) return false;
     }
   }
   return true;
+}
+
+// Element-wise conversion, e.g. a float tensor into bf16 (rounding to nearest
+// even) or back (exact).
+template <typename To, typename From, std::size_t... Dims>
+Tensor<To, Dims...> tensor_cast(const Tensor<From, Dims...>& t) {
+  Tensor<To, Dims...> out;
+  for (std::size_t i = 0; i < t.size(); ++i) {
+    out[i] = static_cast<To>(static_cast<accumulator_t<From>>(t[i]));
+  }
+  return out;
+}
+
+// `t` as a tensor of To: the same object when it already is one, a converted
+// copy otherwise. For code that keeps a float scratch tensor and must hand a
+// T tensor on, at no cost when T is float.
+template <typename To, typename From, std::size_t... Dims>
+decltype(auto) as_tensor_of(const Tensor<From, Dims...>& t) {
+  if constexpr (std::is_same_v<To, From>) {
+    return (t);
+  } else {
+    return tensor_cast<To>(t);
+  }
 }
 
 [[noreturn]] void throw_not_finite(const char* what);
@@ -309,6 +339,9 @@ bool all_finite(const Tensor<T, Dims...>& t) {
 
 template <std::size_t... Dims>
 using TensorF = Tensor<float, Dims...>;
+
+template <std::size_t... Dims>
+using TensorB = Tensor<bf16, Dims...>;
 
 template <std::size_t... Dims>
 using TensorI8 = Tensor<std::int8_t, Dims...>;
