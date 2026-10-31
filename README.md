@@ -1,34 +1,13 @@
 # ztensor
 
-A small C++20 tensor and transformer library: fixed-size tensors, hand-written
+For my prototypes, I needed a C++ tensor library for both training and inference. 
+Models are small (millions of params) so there is no need in GPU. 
+
+I looked at top projects and they were too big; and I did the common thing nowadays - vibe-coded 
+a small C++20 tensor and transformer library. ZTenzor is fixed-size tensors, hand-written
 forward and backward passes, plain SGD, and no dependencies beyond the standard
 library. Shapes are template parameters, so a mismatched layer is a compile
 error rather than a runtime one.
-
-## Contents
-
-| header | what |
-|---|---|
-| `tensor.h` | `Tensor<T, Dims...>`: a fixed-shape, zero-initialised array |
-| `add.h`, `mul.h`, `dot.h` | elementwise ops, matmul, dot product |
-| `layers.h` | `Linear`, `LayerNorm`, `Embedding`, activations, softmax |
-| `mlp.h` | `Mlp` |
-| `attention.h` | `MultiHeadSelfAttention` (padding mask, optional causal mask) |
-| `transformer.h` | `FeedForward`, `TransformerBlock`, `Transformer` (encoder stack) |
-| `cross_attention.h` | `MultiHeadCrossAttention`, `DecoderBlock`, `TransformerDecoder` |
-| `loss.h` | `MseLoss`, `SoftmaxCrossEntropyLoss`, `InfoNceLoss` |
-| `query_model.h` | `QueryModel`, one tower of a two-tower retrieval model |
-
-Every trainable piece follows the same protocol:
-
-- `randomize(rng)` initialises the weights.
-- `forward(...)` computes the output.
-- `backward(...)` accumulates gradients and returns the gradient of the input.
-- `zero_grad()` clears the gradients, and `apply_sgd(lr)` takes one SGD step.
-
-Depth and head count are runtime arguments. Sequence lengths and widths are
-template parameters. Use `set_valid_length` and `set_memory_length` to mask a
-padded tail.
 
 ## Build
 
