@@ -122,6 +122,70 @@ TEST(LinearBlocking, FourRowKernelMatchesOneRowExactly) {
   check_row_blocking<3, 9>();  // narrower than a vector
 }
 
+// Tall stacks go to the BLAS backend when it is built in. Its summation order
+// is its own, so it is held to a tolerance rather than to exact equality.
+template <std::size_t In, std::size_t Out>
+void check_tall_stack() {
+  constexpr std::size_t kRows = zf::blas::kMinRows + 5;
+  std::mt19937 rng(4);
+  zf::Linear<float, In, Out> tall;
+  tall.randomize(rng);
+  zf::Linear<float, In, Out> single = tall;
+  zf::Tensor<float, kRows, In> x;
+  zf::Tensor<float, kRows, Out> g;
+  fill(x, rng);
+  fill(g, rng);
+  fill(tall.bias(), rng);
+  single.bias() = tall.bias();
+
+  const auto out = tall.template forward<kRows>(x);
+  const auto dx = tall.template backward<kRows>(x, g);
+  zf::Tensor<float, kRows, Out> out_single;
+  zf::Tensor<float, kRows, In> dx_single;
+  for (std::size_t r = 0; r < kRows; ++r) {
+    single.forward_into(row(x, r), out_single.data() + r * Out, 1);
+    single.backward_into(row(x, r), row(g, r), dx_single.data() + r * In, 1);
+  }
+  expect_tensors_near(out, out_single, kTol, "out");
+  expect_tensors_near(dx, dx_single, kTol, "dx");
+  expect_tensors_near(tall.weight_grad(), single.weight_grad(), kTol, "dW");
+  expect_tensors_near(tall.bias_grad(), single.bias_grad(), kTol, "db");
+}
+
+TEST(LinearBlocking, TallStackMatchesOneRowAtATime) {
+  check_tall_stack<32, 64>();
+  check_tall_stack<6, 5>();
+}
+
+// Adjacent spans are computed as one stack; a gap between them must stay
+// untouched, and the result must not depend on how the rows were split.
+TEST(LinearBlocking, SpansMergeWithoutTouchingGaps) {
+  constexpr std::size_t kRows = 2 * zf::blas::kMinRows;
+  constexpr std::size_t kHalf = zf::blas::kMinRows;
+  std::mt19937 rng(10);
+  zf::Linear<float, 8, 8> layer;
+  layer.randomize(rng);
+  zf::Tensor<float, kRows, 8> x;
+  fill(x, rng);
+
+  const auto whole = layer.template forward<kRows>(x);
+  // Touching spans [0, half) + [half, rows - 4), then a gap, then 2 rows.
+  const zf::RowSpan spans[] = {{0, kHalf}, {kHalf, kHalf - 4}, {kRows - 2, 2}};
+  zf::Tensor<float, kRows, 8> out;
+  out.fill(7.0f);
+  layer.forward_spans(x, out, spans);
+  for (std::size_t r = 0; r < kRows; ++r) {
+    const bool gap = r >= 2 * kHalf - 4 && r < kRows - 2;
+    for (std::size_t o = 0; o < 8; ++o) {
+      if (gap) {
+        EXPECT_EQ(out(r, o), 7.0f) << r;
+      } else {
+        EXPECT_NEAR(out(r, o), whole(r, o), kTol) << r;
+      }
+    }
+  }
+}
+
 // --- batched attention and blocks ------------------------------------------
 
 constexpr std::size_t kB = 3;

@@ -27,6 +27,12 @@ Other options:
 - `-DZTENSOR_NATIVE=ON` compiles for the build machine's CPU (`-march=native`).
   It matters on x86, where the default baseline is SSE2; arm64's baseline
   already has NEON.
+- `-DZTENSOR_ACCELERATE=ON` (the default on Apple) sends tall float stacks
+  (64+ rows, i.e. row-stacked batches) through Accelerate's SGEMM. On Apple
+  Silicon it makes a 64-example decoder step about 1.4x faster. Shorter
+  stacks keep the inline kernels, so single sequences are unchanged. The
+  GEMM sums in its own order, so batched results can differ from one example
+  at a time in the last bits. Turn it off for bit-exact batching.
 - `-DZTENSOR_CHECK_FINITE=ON` is a debug check. It throws
   `std::runtime_error` at the first NaN or infinity after any block's forward
   or backward pass. `zf::all_finite(t)` is available for your own checks.

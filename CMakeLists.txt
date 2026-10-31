@@ -11,6 +11,13 @@ option(ZTENSOR_BUILD_TESTS "Build unit tests (needs GTest)" ON)
 # Matters on x86, where the baseline is SSE2; arm64's baseline already has NEON.
 option(ZTENSOR_CHECK_FINITE "Throw on NaN/Inf after every block (debug)" OFF)
 option(ZTENSOR_NATIVE "Compile for the build machine's CPU (-march=native)" OFF)
+# Multi-row float Linear layers through Accelerate's SGEMM. Off elsewhere: the
+# inline kernels are the portable path.
+if(APPLE)
+  option(ZTENSOR_ACCELERATE "Use Apple Accelerate SGEMM for multi-row Linear" ON)
+else()
+  set(ZTENSOR_ACCELERATE OFF)
+endif()
 
 set(ZTENSOR_WARNINGS
   $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic>
@@ -28,6 +35,7 @@ add_library(ztensor
   src/transformer.cpp
   src/query_model.cpp
   src/loss.cpp
+  src/blas.cpp
 )
 target_include_directories(ztensor PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
@@ -35,6 +43,11 @@ target_include_directories(ztensor PUBLIC
 target_compile_options(ztensor PRIVATE ${ZTENSOR_WARNINGS})
 if(ZTENSOR_CHECK_FINITE)
   target_compile_definitions(ztensor PUBLIC ZTENSOR_CHECK_FINITE)
+endif()
+if(ZTENSOR_ACCELERATE)
+  # PUBLIC: Linear is a template, so the switch must reach the user's code.
+  target_compile_definitions(ztensor PUBLIC ZF_USE_ACCELERATE)
+  target_link_libraries(ztensor PUBLIC "-framework Accelerate")
 endif()
 if(ZTENSOR_NATIVE)
   # PUBLIC: the kernels are templates, compiled in the user's translation units.

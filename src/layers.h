@@ -7,6 +7,7 @@
 #include <random>
 #include <type_traits>
 
+#include "blas.h"
 #include "tensor.h"
 
 // Primitive layers shared by the models.
@@ -398,7 +399,20 @@ class Linear {
 
   // Raw-pointer forms: `rows` rows of x (InDim each) into out (OutDim each),
   // and the matching backward, which adds into dx.
+  //
+  // With the BLAS backend on, float stacks of at least blas::kMinRows rows go
+  // to SGEMM instead (see blas.h for why the bar is that high). SGEMM sums in
+  // its own order, so on that path a row's result can differ in the last bits
+  // from the same row computed alone.
+  static constexpr bool kUseBlas = blas::kEnabled && std::is_same_v<T, float>;
+
   void forward_into(const T* x, T* out, std::size_t rows) const {
+    if constexpr (kUseBlas) {
+      if (rows >= blas::kMinRows) {
+        blas::linear_forward(x, w_.data(), b_.data(), out, rows, InDim, OutDim);
+        return;
+      }
+    }
     std::size_t r = 0;
     for (; r + kRowBlock <= rows; r += kRowBlock) {
       matmul_rows<kRowBlock>(x + r * InDim, out + r * OutDim);
@@ -409,25 +423,52 @@ class Linear {
   // Span forms over a row-stacked tensor: only rows inside `spans` are
   // computed. forward_spans overwrites those rows of `out` and leaves the
   // rest alone; backward_spans adds into those rows of `dx`.
+  //
+  // Spans that touch are merged into one call: a batch of full-length
+  // examples is then a single tall matmul instead of one per example.
   template <std::size_t Rows>
   void forward_spans(const Tensor<T, Rows, InDim>& x, Tensor<T, Rows, OutDim>& out,
                      RowSpans spans) const {
-    for (const RowSpan& s : spans) {
-      forward_into(x.data() + s.start * InDim, out.data() + s.start * OutDim, s.count);
-    }
+    for_merged_spans(spans, [&](std::size_t start, std::size_t count) {
+      forward_into(x.data() + start * InDim, out.data() + start * OutDim, count);
+    });
   }
 
   template <std::size_t Rows>
   void backward_spans(const Tensor<T, Rows, InDim>& x,
                       const Tensor<T, Rows, OutDim>& d_out,
                       Tensor<T, Rows, InDim>& dx, RowSpans spans) {
+    for_merged_spans(spans, [&](std::size_t start, std::size_t count) {
+      backward_into(x.data() + start * InDim, d_out.data() + start * OutDim,
+                    dx.data() + start * InDim, count);
+    });
+  }
+
+  template <typename Body>
+  static void for_merged_spans(RowSpans spans, Body&& body) {
+    std::size_t start = 0;
+    std::size_t count = 0;
     for (const RowSpan& s : spans) {
-      backward_into(x.data() + s.start * InDim, d_out.data() + s.start * OutDim,
-                    dx.data() + s.start * InDim, s.count);
+      if (s.count == 0) continue;
+      if (count != 0 && s.start == start + count) {
+        count += s.count;
+        continue;
+      }
+      if (count != 0) body(start, count);
+      start = s.start;
+      count = s.count;
     }
+    if (count != 0) body(start, count);
   }
 
   void backward_into(const T* x, const T* d_out, T* dx, std::size_t rows) {
+    if constexpr (kUseBlas) {
+      if (rows >= blas::kMinRows) {
+        blas::linear_backward(x, d_out, w_.data(), dx, dw_.data(), db_.data(),
+                              rows, InDim, OutDim);
+        return;
+      }
+    }
     std::size_t r = 0;
     for (; r + kRowBlock <= rows; r += kRowBlock) {
       matmul_rows_backward<kRowBlock>(x + r * InDim, d_out + r * OutDim,
