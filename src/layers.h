@@ -83,27 +83,40 @@ T activation_grad(Activation act, T x) {
 
 // Activation and its derivative together, sharing the one tanh. A layer that
 // will need the derivative in backward stores it here instead of recomputing.
+// `Act` is a template parameter, so the choice is made at compile time and the
+// inner loop carries no switch.
+template <Activation Act, typename T>
+ZF_ALWAYS_INLINE T activate_with_grad(T x, T* grad) {
+  if constexpr (Act == Activation::kRelu) {
+    *grad = x > T{0} ? T{1} : T{0};
+    return x > T{0} ? x : T{0};
+  } else if constexpr (Act == Activation::kGelu) {
+    const T c = static_cast<T>(0.7978845608028654);
+    const T x2 = x * x;
+    const T u = c * (x + static_cast<T>(0.044715) * x * x2);
+    const T t = fast_tanh(u);
+    const T du = c * (T{1} + static_cast<T>(3 * 0.044715) * x2);
+    *grad = static_cast<T>(0.5) * (T{1} + t) +
+            static_cast<T>(0.5) * x * (T{1} - t * t) * du;
+    return static_cast<T>(0.5) * x * (T{1} + t);
+  } else {
+    *grad = T{1};
+    return x;
+  }
+}
+
+// The same, with the activation chosen at run time.
 template <typename T>
 T activation_apply_with_grad(Activation act, T x, T* grad) {
   switch (act) {
     case Activation::kRelu:
-      *grad = x > T{0} ? T{1} : T{0};
-      return x > T{0} ? x : T{0};
-    case Activation::kGelu: {
-      const T c = static_cast<T>(0.7978845608028654);
-      const T x2 = x * x;
-      const T u = c * (x + static_cast<T>(0.044715) * x * x2);
-      const T t = fast_tanh(u);
-      const T du = c * (T{1} + static_cast<T>(3 * 0.044715) * x2);
-      *grad = static_cast<T>(0.5) * (T{1} + t) +
-              static_cast<T>(0.5) * x * (T{1} - t * t) * du;
-      return static_cast<T>(0.5) * x * (T{1} + t);
-    }
+      return activate_with_grad<Activation::kRelu>(x, grad);
+    case Activation::kGelu:
+      return activate_with_grad<Activation::kGelu>(x, grad);
     case Activation::kIdentity:
       break;
   }
-  *grad = T{1};
-  return x;
+  return activate_with_grad<Activation::kIdentity>(x, grad);
 }
 
 // y = W x + b, with W stored as [OutDim, InDim].

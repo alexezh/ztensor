@@ -55,6 +55,14 @@ constexpr std::size_t kQueries = 13;
 }  // namespace
 
 int main() {
+  // Spin for ~300 ms first. Whatever runs first otherwise measures the core
+  // ramping up its clock (or being moved off an efficiency core) rather than
+  // the code: Linear forward, the first benchmark, read ~1.6x slow without it.
+  {
+    const auto until = Clock::now() + std::chrono::milliseconds(300);
+    volatile float spin = 0.0f;
+    while (Clock::now() < until) spin = spin + 1.0f;
+  }
   std::mt19937 rng(7);
   std::printf("tensor hot paths, shapes as used by ZVisionComp/ZForward\n");
   std::printf("  sequence %zu, model dim %zu, ffn %zu\n\n", kSeq, kDim, kFf);
@@ -223,7 +231,7 @@ int main() {
       }
     });
 
-    auto batched = std::make_unique<zf::TransformerDecoder<float, kQ, kM, kDim, kFf, kB>>(4, 4);
+    auto batched = std::make_unique<zf::TransformerDecoder<float, kQ, kM, kDim, kFf, zf::Activation::kGelu, kB>>(4, 4);
     batched->randomize(rng);
     zf::Tensor<float, kB * kQ, kDim> xb;
     zf::Tensor<float, kB * kM, kDim> memb;

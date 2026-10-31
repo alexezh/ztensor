@@ -268,7 +268,8 @@ class MultiHeadCrossAttention {
 // same arrangement TransformerBlock uses, with the cross-attention stage
 // inserted between the two.
 template <typename T, std::size_t QueryLen, std::size_t MemoryLen,
-          std::size_t ModelDim, std::size_t FfHidden, std::size_t Batch = 1>
+          std::size_t ModelDim, std::size_t FfHidden,
+          Activation Act = Activation::kGelu, std::size_t Batch = 1>
 class DecoderBlock {
  public:
   using value_type = T;
@@ -282,8 +283,10 @@ class DecoderBlock {
       FeedForward<T, QueryLen, ModelDim, FfHidden>::parameter_count +
       3 * LayerNorm<T, ModelDim>::parameter_count;
 
-  explicit DecoderBlock(std::size_t heads, Activation act = Activation::kGelu)
-      : self_(heads, /*causal=*/false), cross_(heads), ff_(act) {}
+  using FF = FeedForward<T, Batch * QueryLen, ModelDim, FfHidden, Act>;
+
+  explicit DecoderBlock(std::size_t heads)
+      : self_(heads, /*causal=*/false), cross_(heads) {}
 
   std::size_t heads() const { return self_.heads(); }
   std::size_t rows() const { return self_.valid_length(); }
@@ -356,7 +359,7 @@ class DecoderBlock {
     return self_;
   }
   Cross& cross_attention() { return cross_; }
-  FeedForward<T, Batch * QueryLen, ModelDim, FfHidden>& feed_forward() { return ff_; }
+  FF& feed_forward() { return ff_; }
   LayerNorm<T, ModelDim>& self_norm() { return ln1_; }
   LayerNorm<T, ModelDim>& cross_norm() { return ln2_; }
   LayerNorm<T, ModelDim>& feed_forward_norm() { return ln3_; }
@@ -364,7 +367,7 @@ class DecoderBlock {
  private:
   MultiHeadSelfAttention<T, QueryLen, ModelDim, Batch> self_;
   Cross cross_;
-  FeedForward<T, Batch * QueryLen, ModelDim, FfHidden> ff_;
+  FF ff_;
   LayerNorm<T, ModelDim> ln1_;
   LayerNorm<T, ModelDim> ln2_;
   LayerNorm<T, ModelDim> ln3_;
@@ -381,11 +384,12 @@ class DecoderBlock {
 // encoder memory. Depth is runtime, as in Transformer: every block has the
 // same parameter shapes.
 template <typename T, std::size_t QueryLen, std::size_t MemoryLen,
-          std::size_t ModelDim, std::size_t FfHidden, std::size_t Batch = 1>
+          std::size_t ModelDim, std::size_t FfHidden,
+          Activation Act = Activation::kGelu, std::size_t Batch = 1>
 class TransformerDecoder {
  public:
   using value_type = T;
-  using Block = DecoderBlock<T, QueryLen, MemoryLen, ModelDim, FfHidden, Batch>;
+  using Block = DecoderBlock<T, QueryLen, MemoryLen, ModelDim, FfHidden, Act, Batch>;
   using QuerySequence = typename Block::QuerySequence;
   using MemorySequence = typename Block::MemorySequence;
 
@@ -394,14 +398,13 @@ class TransformerDecoder {
   static constexpr std::size_t model_dim = ModelDim;
   static constexpr std::size_t batch = Batch;
 
-  TransformerDecoder(std::size_t levels, std::size_t heads,
-                     Activation act = Activation::kGelu) {
+  TransformerDecoder(std::size_t levels, std::size_t heads) {
     if (levels == 0) {
       throw std::invalid_argument("a decoder needs at least one level");
     }
     blocks_.reserve(levels);
     for (std::size_t i = 0; i < levels; ++i) {
-      blocks_.emplace_back(heads, act);
+      blocks_.emplace_back(heads);
     }
   }
 

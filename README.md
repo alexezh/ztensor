@@ -22,6 +22,15 @@ cmake --build build/release
 
 Pass `-DZTENSOR_BUILD_TESTS=OFF` to build without GTest.
 
+Other options:
+
+- `-DZTENSOR_NATIVE=ON` compiles for the build machine's CPU (`-march=native`).
+  It matters on x86, where the default baseline is SSE2; arm64's baseline
+  already has NEON.
+- `-DZTENSOR_CHECK_FINITE=ON` is a debug check. It throws
+  `std::runtime_error` at the first NaN or infinity after any block's forward
+  or backward pass. `zf::all_finite(t)` is available for your own checks.
+
 ## Example: a cross-attention decoder that learns to point
 
 In this task, four memory tokens hold random symbols, and one query names a
@@ -67,3 +76,39 @@ queries to the memory, then a feed-forward layer. `TransformerDecoder` stacks
 the blocks and adds a final LayerNorm. For a plain encoder over a single
 sequence, use `Transformer<T, SeqLen, ModelDim, FfHidden>(depth, heads)` in the
 same way.
+
+## Activation and batching
+
+The feed-forward activation is a template parameter that comes after
+`FfHidden` and defaults to GELU:
+
+```cpp
+zf::TransformerDecoder<float, Q, M, D, F, zf::Activation::kRelu> decoder(4, 4);
+```
+
+GELU uses a vectorizable tanh accurate to within 3e-7 of `std::tanh`. The
+forward pass stores the GELU derivative so the backward pass doesn't recompute
+it.
+
+The last template parameter, `Batch`, stacks that many independent examples
+row by row. A batched tensor has `Batch * Q` rows, and example `b` occupies
+rows `[b * Q, (b + 1) * Q)`. Attention is block-diagonal, so an example only
+ever sees its own rows. Each example can have its own valid length, set with
+`set_valid_length(b, n)` and `set_memory_length(b, n)`:
+
+```cpp
+zf::TransformerDecoder<float, Q, M, D, F, zf::Activation::kGelu, 64> decoder(4, 4);
+decoder.zero_grad();
+auto y = decoder.forward(x, memory);    // x: (64*Q) x D, memory: (64*M) x D
+decoder.backward(d_y, &d_memory);       // gradients summed over the 64 examples
+decoder.apply_sgd(lr / 64);             // one step for the whole batch
+```
+
+Tests check that a batch gives the same outputs and gradients as running its
+examples one at a time.
+
+Batching does not make a single thread faster at these sizes. Time per example
+is flat from a batch size of 1 to 64, because small layers already run in
+4-row blocks. Batching is there so gradients can be averaged over many
+examples and a later multi-threaded trainer can split a batch across cores.
+

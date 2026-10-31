@@ -204,7 +204,7 @@ TEST(BatchedSelfAttention, MatchesOneExampleAtATime) {
 
 TEST(BatchedTransformer, MatchesOneExampleAtATime) {
   std::mt19937 rng(6);
-  zf::Transformer<float, kSeq, kDim, kFf, kB> batched(2, 2);
+  zf::Transformer<float, kSeq, kDim, kFf, zf::Activation::kGelu, kB> batched(2, 2);
   std::mt19937 init(12);
   batched.randomize(init);
   zf::Transformer<float, kSeq, kDim, kFf> single(2, 2);
@@ -236,7 +236,7 @@ TEST(BatchedTransformer, MatchesOneExampleAtATime) {
 
 TEST(BatchedDecoder, MatchesOneExampleAtATime) {
   std::mt19937 rng(7);
-  zf::TransformerDecoder<float, kSeq, kMem, kDim, kFf, kB> batched(2, 2);
+  zf::TransformerDecoder<float, kSeq, kMem, kDim, kFf, zf::Activation::kGelu, kB> batched(2, 2);
   std::mt19937 init(13);
   batched.randomize(init);
   zf::TransformerDecoder<float, kSeq, kMem, kDim, kFf> single(2, 2);
@@ -283,7 +283,7 @@ TEST(BatchedDecoder, MatchesOneExampleAtATime) {
 
 TEST(BatchedDecoder, OneExampleCannotInfluenceAnother) {
   std::mt19937 rng(8);
-  zf::TransformerDecoder<float, kSeq, kMem, kDim, kFf, kB> decoder(2, 2);
+  zf::TransformerDecoder<float, kSeq, kMem, kDim, kFf, zf::Activation::kGelu, kB> decoder(2, 2);
   decoder.randomize(rng);
   zf::Tensor<float, kB * kSeq, kDim> x;
   zf::Tensor<float, kB * kMem, kDim> memory;
@@ -314,7 +314,7 @@ TEST(BatchedDecoder, OneExampleCannotInfluenceAnother) {
 
 TEST(BatchedDecoder, GradientsMatchFiniteDifferences) {
   constexpr std::size_t kB2 = 2;
-  zf::TransformerDecoder<float, 3, 4, kDim, kFf, kB2> decoder(2, 2);
+  zf::TransformerDecoder<float, 3, 4, kDim, kFf, zf::Activation::kGelu, kB2> decoder(2, 2);
   std::mt19937 rng(9);
   decoder.randomize(rng);
   decoder.set_valid_length(1, 2);
@@ -350,7 +350,7 @@ TEST(BatchedDecoder, GradientsMatchFiniteDifferences) {
 
 TEST(Determinism, SameSeedTrainsToIdenticalWeights) {
   const auto train = [] {
-    zf::TransformerDecoder<float, kSeq, kMem, kDim, kFf, kB> decoder(2, 2);
+    zf::TransformerDecoder<float, kSeq, kMem, kDim, kFf, zf::Activation::kGelu, kB> decoder(2, 2);
     std::mt19937 rng(21);
     decoder.randomize(rng);
     zf::Tensor<float, kB * kSeq, kDim> x;
@@ -397,6 +397,53 @@ TEST(FastTanh, StoredGeluDerivativeMatchesTheRecomputedOne) {
     EXPECT_EQ(y, zf::activation_apply(zf::Activation::kGelu, x));
     EXPECT_EQ(grad, zf::activation_grad(zf::Activation::kGelu, x));
   }
+}
+
+}  // namespace
+
+namespace {
+
+// --- activation as a template parameter ------------------------------------
+
+TEST(ReluDecoder, GradientsMatchFiniteDifferences) {
+  zf::TransformerDecoder<float, 3, 4, 8, 16, zf::Activation::kRelu, 2> decoder(2, 2);
+  static_assert(decltype(decoder)::Block::FF::activation == zf::Activation::kRelu);
+  std::mt19937 rng(31);
+  decoder.randomize(rng);
+  zf::Tensor<float, 6, 8> x;
+  zf::Tensor<float, 8, 8> memory;
+  zf::Tensor<float, 6, 8> weights;
+  fill(x, rng);
+  fill(memory, rng);
+  fill(weights, rng);
+  const auto loss = [&]() {
+    const auto out = decoder.forward(x, memory);
+    float sum = 0.0f;
+    for (std::size_t i = 0; i < out.size(); ++i) sum += out[i] * weights[i];
+    return sum;
+  };
+  loss();
+  zf::Tensor<float, 8, 8> d_memory;
+  const auto dx = decoder.backward(weights, &d_memory);
+  // A smaller step: ReLU's kink makes wide central differences unreliable.
+  zf_test::expect_grads_match(zf_test::slots_of(x), zf_test::values_of(dx), loss,
+                              "relu dx", 2e-2, 2e-4f);
+  zf_test::expect_grads_match(zf_test::slots_of(memory), zf_test::values_of(d_memory),
+                              loss, "relu d_memory", 2e-2, 2e-4f);
+}
+
+TEST(ReluDecoder, DiffersFromGeluWithTheSameWeights) {
+  zf::TransformerDecoder<float, 3, 4, 8, 16, zf::Activation::kRelu> relu(1, 2);
+  zf::TransformerDecoder<float, 3, 4, 8, 16, zf::Activation::kGelu> gelu(1, 2);
+  std::mt19937 a(5), b(5);
+  relu.randomize(a);
+  gelu.randomize(b);
+  zf::Tensor<float, 3, 8> x;
+  zf::Tensor<float, 4, 8> memory;
+  std::mt19937 rng(6);
+  fill(x, rng);
+  fill(memory, rng);
+  EXPECT_NE(relu.forward(x, memory), gelu.forward(x, memory));
 }
 
 }  // namespace

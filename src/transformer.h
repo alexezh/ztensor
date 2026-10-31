@@ -13,9 +13,10 @@
 namespace zf {
 
 // Position-wise feed-forward sublayer: ModelDim -> FfHidden -> ModelDim,
-// applied to every row of the sequence with shared weights.
+// applied to every row of the sequence with shared weights. The hidden
+// activation `Act` (GELU or ReLU) is a template parameter.
 template <typename T, std::size_t SeqLen, std::size_t ModelDim,
-          std::size_t FfHidden>
+          std::size_t FfHidden, Activation Act = Activation::kGelu>
 class FeedForward {
  public:
   using Sequence = Tensor<T, SeqLen, ModelDim>;
@@ -25,10 +26,7 @@ class FeedForward {
       Linear<T, ModelDim, FfHidden>::parameter_count +
       Linear<T, FfHidden, ModelDim>::parameter_count;
 
-  explicit FeedForward(Activation act = Activation::kGelu) : act_(act) {}
-
-  Activation activation() const { return act_; }
-  void set_activation(Activation act) { act_ = act; }
+  static constexpr Activation activation = Act;
 
   template <typename Rng>
   void randomize(Rng& rng) {
@@ -52,7 +50,7 @@ class FeedForward {
     for (const RowSpan& s : spans_) {
       // The derivative is stored now, while its tanh is at hand.
       for (std::size_t i = s.start * FfHidden; i < (s.start + s.count) * FfHidden; ++i) {
-        h_[i] = activation_apply_with_grad(act_, h_pre_[i], &dact_[i]);
+        h_[i] = activate_with_grad<Act>(h_pre_[i], &dact_[i]);
       }
     }
     Sequence out;
@@ -87,7 +85,6 @@ class FeedForward {
   Linear<T, FfHidden, ModelDim>& output_layer() { return fc2_; }
 
  private:
-  Activation act_;
   Linear<T, ModelDim, FfHidden> fc1_;
   Linear<T, FfHidden, ModelDim> fc2_;
 
@@ -102,13 +99,14 @@ class FeedForward {
 //   h = x + attention(layernorm(x))
 //   y = h + feedforward(layernorm(h))
 //
-// Sequence length, model width and FFN width are template parameters, so all
-// parameter tensors are shape-checked. Head count, causal masking and the FFN
-// activation are runtime settings; none of them changes a parameter shape.
-// `Batch` stacks that many independent sequences row-wise; see
-// MultiHeadSelfAttention.
+// Sequence length, model width, FFN width and the FFN activation are template
+// parameters, so all parameter tensors are shape-checked and the activation
+// costs no branch. Head count and causal masking are runtime settings; neither
+// changes a parameter shape. `Batch` stacks that many independent sequences
+// row-wise; see MultiHeadSelfAttention.
 template <typename T, std::size_t SeqLen, std::size_t ModelDim,
-          std::size_t FfHidden, std::size_t Batch = 1>
+          std::size_t FfHidden, Activation Act = Activation::kGelu,
+          std::size_t Batch = 1>
 class TransformerBlock {
   static_assert(std::is_floating_point_v<T>,
                 "trainable models require a floating point element type");
@@ -127,9 +125,10 @@ class TransformerBlock {
       FeedForward<T, SeqLen, ModelDim, FfHidden>::parameter_count +
       2 * LayerNorm<T, ModelDim>::parameter_count;
 
-  explicit TransformerBlock(std::size_t heads, bool causal = false,
-                            Activation act = Activation::kGelu)
-      : attn_(heads, causal), ff_(act) {}
+  using FF = FeedForward<T, Batch * SeqLen, ModelDim, FfHidden, Act>;
+
+  explicit TransformerBlock(std::size_t heads, bool causal = false)
+      : attn_(heads, causal) {}
 
   std::size_t heads() const { return attn_.heads(); }
   bool causal() const { return attn_.causal(); }
@@ -187,13 +186,13 @@ class TransformerBlock {
   }
 
   Attention& attention() { return attn_; }
-  FeedForward<T, Batch * SeqLen, ModelDim, FfHidden>& feed_forward() { return ff_; }
+  FF& feed_forward() { return ff_; }
   LayerNorm<T, ModelDim>& attention_norm() { return ln1_; }
   LayerNorm<T, ModelDim>& feed_forward_norm() { return ln2_; }
 
  private:
   Attention attn_;
-  FeedForward<T, Batch * SeqLen, ModelDim, FfHidden> ff_;
+  FF ff_;
   LayerNorm<T, ModelDim> ln1_;
   LayerNorm<T, ModelDim> ln2_;
 
@@ -207,28 +206,28 @@ class TransformerBlock {
 // A stack of identical blocks plus a final layer norm. Depth is runtime: every
 // block has the same parameter shapes, so it cannot affect type safety.
 template <typename T, std::size_t SeqLen, std::size_t ModelDim,
-          std::size_t FfHidden, std::size_t Batch = 1>
+          std::size_t FfHidden, Activation Act = Activation::kGelu,
+          std::size_t Batch = 1>
 class Transformer {
   static_assert(std::is_floating_point_v<T>,
                 "trainable models require a floating point element type");
 
  public:
   using value_type = T;
-  using Block = TransformerBlock<T, SeqLen, ModelDim, FfHidden, Batch>;
+  using Block = TransformerBlock<T, SeqLen, ModelDim, FfHidden, Act, Batch>;
   using Sequence = typename Block::Sequence;
 
   static constexpr std::size_t seq_len = SeqLen;
   static constexpr std::size_t model_dim = ModelDim;
   static constexpr std::size_t ff_hidden = FfHidden;
 
-  Transformer(std::size_t depth, std::size_t heads, bool causal = false,
-              Activation act = Activation::kGelu) {
+  Transformer(std::size_t depth, std::size_t heads, bool causal = false) {
     if (depth == 0) {
       throw std::invalid_argument("transformer needs at least one block");
     }
     blocks_.reserve(depth);
     for (std::size_t i = 0; i < depth; ++i) {
-      blocks_.emplace_back(heads, causal, act);
+      blocks_.emplace_back(heads, causal);
     }
   }
 
