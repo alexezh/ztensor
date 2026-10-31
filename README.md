@@ -1,13 +1,15 @@
 # ztensor
 
 For my prototypes, I needed a C++ tensor library for both training and inference. 
-Models are small (millions of params) so there is no need in GPU. 
+My prototype models are small (millions of params) so there is no need in GPU. 
 
-I looked at top projects and they were too big; and I did the common thing nowadays - vibe-coded 
+I looked at top projects with similar code and they were too big; and I did the common thing nowadays - vibe-coded 
 a small C++20 tensor and transformer library. ZTenzor is fixed-size tensors, hand-written
 forward and backward passes, plain SGD, and no dependencies beyond the standard
 library. Shapes are template parameters, so a mismatched layer is a compile
 error rather than a runtime one.
+
+One interesting thing is that since lib is small and does not have dependencies, you can run your model in WASM. 
 
 ## Build
 
