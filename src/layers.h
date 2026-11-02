@@ -474,8 +474,8 @@ class Linear {
   // Raw-pointer forms: `rows` rows of x (InDim each) into out (OutDim each),
   // and the matching backward, which adds into dx.
   //
-  // With the BLAS backend on, float stacks of at least blas::kMinRows rows go
-  // to SGEMM instead (see blas.h for why the bar is that high). SGEMM sums in
+  // With the BLAS backend on, float stacks with enough work go to SGEMM
+  // instead (blas::use_gemm; blas.h has the measurements). SGEMM sums in
   // its own order, so on that path a row's result can differ in the last bits
   // from the same row computed alone.
   //
@@ -490,7 +490,7 @@ class Linear {
 
   void forward_into(const T* x, T* out, std::size_t rows) const {
     if constexpr (kUseBlas) {
-      if (rows >= blas::kMinRows) {
+      if (blas::use_gemm(rows, InDim, OutDim)) {
         blas::linear_forward(x, w_.data(), b_.data(), out, rows, InDim, OutDim);
         return;
       }
@@ -551,7 +551,7 @@ class Linear {
 
   void backward_into(const T* x, const T* d_out, T* dx, std::size_t rows) {
     if constexpr (kUseBlas) {
-      if (rows >= blas::kMinRows) {
+      if (blas::use_gemm(rows, InDim, OutDim)) {
         blas::linear_backward(x, d_out, w_.data(), dx, dw_.data(), db_.data(),
                               rows, InDim, OutDim);
         return;
@@ -580,7 +580,7 @@ class Linear {
     Acc* wf = detail::widen_scratch<Acc>(0, OutDim * InDim);
     widen_into(w_.data(), wf, OutDim * InDim);
     if constexpr (blas::kEnabled) {
-      if (rows >= blas::kMinRows) {
+      if (blas::use_gemm(rows, InDim, OutDim)) {
         Acc* xf = detail::widen_scratch<Acc>(1, rows * InDim);
         Acc* bf = detail::widen_scratch<Acc>(2, OutDim);
         Acc* of = detail::widen_scratch<Acc>(3, rows * OutDim);
@@ -604,7 +604,7 @@ class Linear {
     Acc* wf = detail::widen_scratch<Acc>(0, OutDim * InDim);
     widen_into(w_.data(), wf, OutDim * InDim);
     if constexpr (blas::kEnabled) {
-      if (rows >= blas::kMinRows) {
+      if (blas::use_gemm(rows, InDim, OutDim)) {
         Acc* xf = detail::widen_scratch<Acc>(1, rows * InDim);
         Acc* gf = detail::widen_scratch<Acc>(2, rows * OutDim);
         Acc* dxf = detail::widen_scratch<Acc>(3, rows * InDim);
@@ -676,57 +676,14 @@ class LayerNorm {
 
   Tensor<T, Dim> forward(const Tensor<T, Dim>& x) const {
     Tensor<T, Dim> out;
-    Acc mean{};
-    for (std::size_t i = 0; i < Dim; ++i) {
-      mean += x(i);
-    }
-    mean /= static_cast<Acc>(Dim);
-    Acc var{};
-    for (std::size_t i = 0; i < Dim; ++i) {
-      const Acc c = x(i) - mean;
-      var += c * c;
-    }
-    var /= static_cast<Acc>(Dim);
-    const Acc rstd = Acc{1} / std::sqrt(var + eps_);
-    for (std::size_t i = 0; i < Dim; ++i) {
-      out(i) = static_cast<T>(gamma_(i) * (x(i) - mean) * rstd + beta_(i));
-    }
+    normalize_row(x.data(), out.data());
     return out;
   }
 
   Tensor<T, Dim> backward(const Tensor<T, Dim>& x,
                           const Tensor<T, Dim>& d_out) {
     Tensor<T, Dim> dx;
-    Acc mean{};
-    for (std::size_t i = 0; i < Dim; ++i) {
-      mean += x(i);
-    }
-    mean /= static_cast<Acc>(Dim);
-    Acc var{};
-    for (std::size_t i = 0; i < Dim; ++i) {
-      const Acc c = x(i) - mean;
-      var += c * c;
-    }
-    var /= static_cast<Acc>(Dim);
-    const Acc rstd = Acc{1} / std::sqrt(var + eps_);
-
-    // dy scaled by gamma, plus the two mean terms that normalization couples in
-    Acc sum_dg{};
-    Acc sum_dg_xhat{};
-    for (std::size_t i = 0; i < Dim; ++i) {
-      const Acc xhat = (x(i) - mean) * rstd;
-      const Acc dg = d_out(i) * gamma_(i);
-      dgamma_(i) += d_out(i) * xhat;
-      dbeta_(i) += d_out(i);
-      sum_dg += dg;
-      sum_dg_xhat += dg * xhat;
-    }
-    const Acc inv_n = Acc{1} / static_cast<Acc>(Dim);
-    for (std::size_t i = 0; i < Dim; ++i) {
-      const Acc xhat = (x(i) - mean) * rstd;
-      const Acc dg = d_out(i) * gamma_(i);
-      dx(i) = static_cast<T>(rstd * (dg - inv_n * sum_dg - xhat * inv_n * sum_dg_xhat));
-    }
+    normalize_row_backward(x.data(), d_out.data(), dx.data());
     return dx;
   }
 
@@ -791,21 +748,19 @@ class LayerNorm {
     return dx;
   }
 
-  // One row, in place. Same arithmetic as the single-vector path above.
+  // One row, in place; the single-vector path is the same call.
+  //
+  // The row's reductions (the mean, the variance, and in backward the two
+  // sums normalization couples in) run in four 4-wide accumulators, so
+  // sixteen independent chains instead of one: a single chain waits on each
+  // add's latency, which for a wide row was most of the cost. Summation
+  // order: blocks of 16 into the accumulators, (a0 + a1) + (a2 + a3), the
+  // leftover 4-blocks into that, its lanes (l0 + l1) + (l2 + l3), then the
+  // leftover elements. The elementwise passes need no help.
   ZF_ALWAYS_INLINE void normalize_row(const T* ZF_RESTRICT x,
                                       T* ZF_RESTRICT out) const {
-    Acc mean{};
-    for (std::size_t i = 0; i < Dim; ++i) {
-      mean += x[i];
-    }
-    mean /= static_cast<Acc>(Dim);
-    Acc var{};
-    for (std::size_t i = 0; i < Dim; ++i) {
-      const Acc c = x[i] - mean;
-      var += c * c;
-    }
-    var /= static_cast<Acc>(Dim);
-    const Acc rstd = Acc{1} / std::sqrt(var + eps_);
+    Acc mean, rstd;
+    row_stats(x, &mean, &rstd);
     const T* ZF_RESTRICT g = gamma_.data();
     const T* ZF_RESTRICT b = beta_.data();
     for (std::size_t i = 0; i < Dim; ++i) {
@@ -816,38 +771,32 @@ class LayerNorm {
   ZF_ALWAYS_INLINE void normalize_row_backward(const T* ZF_RESTRICT x,
                                               const T* ZF_RESTRICT d_out,
                                               T* ZF_RESTRICT dx) {
-    Acc mean{};
-    for (std::size_t i = 0; i < Dim; ++i) {
-      mean += x[i];
-    }
-    mean /= static_cast<Acc>(Dim);
-    Acc var{};
-    for (std::size_t i = 0; i < Dim; ++i) {
-      const Acc c = x[i] - mean;
-      var += c * c;
-    }
-    var /= static_cast<Acc>(Dim);
-    const Acc rstd = Acc{1} / std::sqrt(var + eps_);
-
+    Acc mean, rstd;
+    row_stats(x, &mean, &rstd);
     const T* ZF_RESTRICT g = gamma_.data();
     Acc* ZF_RESTRICT dg = dgamma_.data();
     Acc* ZF_RESTRICT db = dbeta_.data();
-    // dy scaled by gamma, plus the two mean terms normalization couples in
-    Acc sum_dg{};
-    Acc sum_dg_xhat{};
     for (std::size_t i = 0; i < Dim; ++i) {
       const Acc xhat = (x[i] - mean) * rstd;
-      const Acc dgi = d_out[i] * g[i];
       dg[i] += d_out[i] * xhat;
       db[i] += d_out[i];
+    }
+    // dy scaled by gamma, plus the two mean terms normalization couples in
+    const V neg_mean = splat(-mean), rstd_v = splat(rstd);
+    const auto dgi = [&](std::size_t i) { return load4(d_out + i) * load4(g + i); };
+    const auto xhat = [&](std::size_t i) { return (load4(x + i) + neg_mean) * rstd_v; };
+    Acc sum_dg = lane_sum(dgi);
+    Acc sum_dg_xhat = lane_sum([&](std::size_t i) { return dgi(i) * xhat(i); });
+    for (std::size_t i = kVec; i < Dim; ++i) {
+      const Acc dgi = d_out[i] * g[i];
       sum_dg += dgi;
-      sum_dg_xhat += dgi * xhat;
+      sum_dg_xhat += dgi * ((x[i] - mean) * rstd);
     }
     const Acc inv_n = Acc{1} / static_cast<Acc>(Dim);
     for (std::size_t i = 0; i < Dim; ++i) {
-      const Acc xhat = (x[i] - mean) * rstd;
-      const Acc dgi = d_out[i] * g[i];
-      dx[i] = static_cast<T>(rstd * (dgi - inv_n * sum_dg - xhat * inv_n * sum_dg_xhat));
+      const Acc xh = (x[i] - mean) * rstd;
+      const Acc dg_i = d_out[i] * g[i];
+      dx[i] = static_cast<T>(rstd * (dg_i - inv_n * sum_dg - xh * inv_n * sum_dg_xhat));
     }
   }
 
@@ -871,6 +820,55 @@ class LayerNorm {
   const Tensor<Acc, Dim>& beta_grad() const { return dbeta_; }
 
  private:
+  static constexpr std::size_t kLanes = 4;
+  static constexpr std::size_t kVec = Dim / kLanes * kLanes;
+  static constexpr std::size_t kBlock = 4 * kLanes;
+  static constexpr std::size_t kVecBlock = Dim / kBlock * kBlock;
+  using V = Vec4<Acc>;
+
+  // The sum over i < kVec of term(i), a V of the four elements at i, in the
+  // order described at normalize_row. The elements past kVec are the
+  // caller's.
+  template <typename Term>
+  static ZF_ALWAYS_INLINE Acc lane_sum(Term&& term) {
+    V a0{}, a1{}, a2{}, a3{};
+    for (std::size_t i = 0; i < kVecBlock; i += kBlock) {
+      a0 += term(i);
+      a1 += term(i + kLanes);
+      a2 += term(i + 2 * kLanes);
+      a3 += term(i + 3 * kLanes);
+    }
+    V a = (a0 + a1) + (a2 + a3);
+    for (std::size_t i = kVecBlock; i < kVec; i += kLanes) a += term(i);
+    return hsum4(a);
+  }
+
+  static ZF_ALWAYS_INLINE V splat(Acc a) {
+    V v{};
+    for (std::size_t k = 0; k < kLanes; ++k) v[k] = a;
+    return v;
+  }
+
+  // A row's mean and 1 / sqrt(var + eps).
+  ZF_ALWAYS_INLINE void row_stats(const T* ZF_RESTRICT x, Acc* mean,
+                                  Acc* rstd) const {
+    Acc sum = lane_sum([&](std::size_t i) { return load4(x + i); });
+    for (std::size_t i = kVec; i < Dim; ++i) sum += x[i];
+    const Acc m = sum / static_cast<Acc>(Dim);
+    const V neg_m = splat(-m);
+    Acc var = lane_sum([&](std::size_t i) {
+      const V c = load4(x + i) + neg_m;
+      return c * c;
+    });
+    for (std::size_t i = kVec; i < Dim; ++i) {
+      const Acc c = x[i] - m;
+      var += c * c;
+    }
+    var /= static_cast<Acc>(Dim);
+    *mean = m;
+    *rstd = Acc{1} / std::sqrt(var + eps_);
+  }
+
   template <std::size_t Rows>
   static Tensor<T, Dim> extract_row(const Tensor<T, Rows, Dim>& m,
                                     std::size_t r) {

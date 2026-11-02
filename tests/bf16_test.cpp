@@ -132,7 +132,7 @@ TEST(Bf16Linear, MatchesFloatWithinRounding) {
 
 // A stack of 8+ bf16 rows widens W and the rows to float once and runs the
 // float kernel. Widening is exact and the order of the sums is the same, so it
-// must match one row at a time bit for bit -- except past blas::kMinRows,
+// must match one row at a time bit for bit -- except from blas::gemm_rows on,
 // where SGEMM's own order is held to a tolerance.
 template <std::size_t kRows>
 void check_widened_stack(bool exact) {
@@ -166,7 +166,7 @@ void check_widened_stack(bool exact) {
 
 TEST(Bf16Linear, WidenedStackMatchesOneRowAtATime) {
   check_widened_stack<11>(/*exact=*/true);
-  check_widened_stack<zf::blas::kMinRows + 3>(/*exact=*/!zf::blas::kEnabled);
+  check_widened_stack<zf::blas::gemm_rows(12, 10) + 3>(/*exact=*/!zf::blas::kEnabled);
 }
 
 TEST(Bf16Softmax, RowSumsToOneWithinRounding) {

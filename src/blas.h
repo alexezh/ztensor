@@ -19,15 +19,36 @@ inline constexpr bool kEnabled = true;
 inline constexpr bool kEnabled = false;
 #endif
 
-// The fewest rows sent to the GEMM; fewer go to the inline kernels. Measured
-// on Apple Silicon at widths 32-64:
-//  - below 16 rows SGEMM takes a slow path and often loses outright;
-//  - in a tight loop it wins 2-3x from 16 rows up, but between other work
-//    (an attention layer, say) the matrix unit cools down and a 48-row call
-//    gains little, while attention around it gets slower;
-//  - a row-stacked batch (64 examples x 12 rows) gains robustly.
-// So the GEMM is for batches, and a single sequence stays on the kernels.
-inline constexpr std::size_t kMinRows = 64;
+// When a Linear call goes to the GEMM rather than the inline kernels: at
+// least kMinRows rows, and at least kMinWork multiply-adds (rows x k x n).
+//
+// The bar is the work, not the rows. Measured on Apple Silicon:
+//  - In a tight loop SGEMM ties or wins from 8 rows at every width tried
+//    (32x32 up to 354x128), and by 3-10x at 16-32 rows of a 354-wide input.
+//    Below 4 rows its backward takes a slow path: 5x the kernels at 2 rows.
+//  - Between other work it is different. At width 32 (this library's
+//    MultiHeadSelfAttention, 48 rows; a 12-row decoder) a Linear alone gains
+//    2.3x, but the attention around it slows, and the blocks come out 5-18%
+//    slower: there is too little work per call to pay for the switch.
+//  - With wide inputs it pays from a few rows. A 4-level cross transformer
+//    on 354-wide tokens, one example per call (8-14 rows), trained 1.5x
+//    faster under this rule than with a flat 64-row bar.
+// 128K multiply-adds keeps a 32x32 layer on the kernels below 128 rows (and
+// a 32x64 one below 64), and sends a 354x64 one from 6 rows. Half that bar
+// gains the wide model another 8% but costs this library's TransformerBlock
+// forward 10%.
+inline constexpr std::size_t kMinRows = 4;
+inline constexpr std::size_t kMinWork = std::size_t{128} * 1024;
+
+constexpr bool use_gemm(std::size_t rows, std::size_t k, std::size_t n) {
+  return rows >= kMinRows && rows * k * n >= kMinWork;
+}
+
+// The fewest rows of a k -> n layer that go to the GEMM.
+constexpr std::size_t gemm_rows(std::size_t k, std::size_t n) {
+  const std::size_t by_work = (kMinWork + k * n - 1) / (k * n);
+  return by_work > kMinRows ? by_work : kMinRows;
+}
 
 // out[rows, n] = x[rows, k] * w[n, k]^T + b[n]. Overwrites out.
 void linear_forward(const float* x, const float* w, const float* b, float* out,

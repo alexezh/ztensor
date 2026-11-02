@@ -126,7 +126,7 @@ TEST(LinearBlocking, FourRowKernelMatchesOneRowExactly) {
 // is its own, so it is held to a tolerance rather than to exact equality.
 template <std::size_t In, std::size_t Out>
 void check_tall_stack() {
-  constexpr std::size_t kRows = zf::blas::kMinRows + 5;
+  constexpr std::size_t kRows = zf::blas::gemm_rows(In, Out) + 5;
   std::mt19937 rng(4);
   zf::Linear<float, In, Out> tall;
   tall.randomize(rng);
@@ -160,8 +160,8 @@ TEST(LinearBlocking, TallStackMatchesOneRowAtATime) {
 // Adjacent spans are computed as one stack; a gap between them must stay
 // untouched, and the result must not depend on how the rows were split.
 TEST(LinearBlocking, SpansMergeWithoutTouchingGaps) {
-  constexpr std::size_t kRows = 2 * zf::blas::kMinRows;
-  constexpr std::size_t kHalf = zf::blas::kMinRows;
+  constexpr std::size_t kHalf = zf::blas::gemm_rows(8, 8);
+  constexpr std::size_t kRows = 2 * kHalf;
   std::mt19937 rng(10);
   zf::Linear<float, 8, 8> layer;
   layer.randomize(rng);
