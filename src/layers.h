@@ -826,25 +826,42 @@ class LayerNorm {
       for (std::size_t r = r0; r < r1; ++r) normalize_row(x + r * Dim, out + r * Dim);
     });
   }
+  // The same under a mask (rows x Dim, see normalize_row_masked).
+  void forward_rows(const T* x, T* out, std::size_t rows, const T* mask,
+                    ThreadPool* pool = nullptr) const {
+    parallel_for(pool, rows, kRowGrain, [&](std::size_t, std::size_t r0, std::size_t r1) {
+      for (std::size_t r = r0; r < r1; ++r) {
+        normalize_row_masked(x + r * Dim, out + r * Dim, mask + r * Dim);
+      }
+    });
+  }
 
   // Overwrites dx; adds into the parameter gradients. Each chunk sums its
   // own dgamma, dbeta, added in chunk order afterwards, so the result is the
   // same on any pool (the chunks depend only on `rows`).
   void backward_rows(const T* x, const T* d_out, T* dx, std::size_t rows,
                      ThreadPool* pool = nullptr) {
+    backward_rows(x, d_out, dx, rows, nullptr, pool);
+  }
+  // The same under a mask (rows x Dim); a null mask is every slot present.
+  void backward_rows(const T* x, const T* d_out, T* dx, std::size_t rows, const T* mask,
+                     ThreadPool* pool = nullptr) {
+    const auto row = [&](std::size_t r, Acc* dg, Acc* db) {
+      if (mask != nullptr) {
+        row_backward_masked(x + r * Dim, d_out + r * Dim, dx + r * Dim, mask + r * Dim, dg, db);
+      } else {
+        row_backward(x + r * Dim, d_out + r * Dim, dx + r * Dim, dg, db);
+      }
+    };
     const std::size_t chunks = chunk_count(rows, kRowGrain);
     if (chunks <= 1) {
-      for (std::size_t r = 0; r < rows; ++r) {
-        normalize_row_backward(x + r * Dim, d_out + r * Dim, dx + r * Dim);
-      }
+      for (std::size_t r = 0; r < rows; ++r) row(r, dgamma_.data(), dbeta_.data());
       return;
     }
     std::vector<Acc> part(chunks * 2 * Dim, Acc{});
     parallel_for(pool, rows, kRowGrain, [&](std::size_t c, std::size_t r0, std::size_t r1) {
       Acc* dg = part.data() + c * 2 * Dim;
-      for (std::size_t r = r0; r < r1; ++r) {
-        row_backward(x + r * Dim, d_out + r * Dim, dx + r * Dim, dg, dg + Dim);
-      }
+      for (std::size_t r = r0; r < r1; ++r) row(r, dg, dg + Dim);
     });
     for (std::size_t c = 0; c < chunks; ++c) {
       const Acc* dg = part.data() + c * 2 * Dim;
@@ -903,6 +920,11 @@ class LayerNorm {
   // LayerNorm, which leaves a nonzero gradient at the norm's input. For a
   // sparse token (most slots absent) this keeps absent slots from leaking a
   // row-dependent bias into whatever reads the normalized vector.
+  //
+  // The mask is 0 or 1 per slot, and the arithmetic multiplies by it rather
+  // than branching, so every pass vectorizes: the reductions run in the same
+  // sixteen accumulators as normalize_row (lane_sum), the elementwise passes
+  // auto-vectorize. (An absent slot's x must be finite: 0 * inf is NaN.)
   ZF_ALWAYS_INLINE void normalize_row_masked(const T* ZF_RESTRICT x,
                                              T* ZF_RESTRICT out,
                                              const T* ZF_RESTRICT mask) const {
@@ -911,7 +933,8 @@ class LayerNorm {
     const T* ZF_RESTRICT g = gamma_.data();
     const T* ZF_RESTRICT b = beta_.data();
     for (std::size_t i = 0; i < Dim; ++i) {
-      out[i] = mask[i] != T{} ? static_cast<T>(g[i] * (x[i] - mean) * rstd + b[i]) : T{};
+      const Acc m = static_cast<Acc>(mask[i]);
+      out[i] = static_cast<T>(m * (g[i] * (x[i] - mean) * rstd + b[i]));
     }
   }
 
@@ -919,31 +942,7 @@ class LayerNorm {
                                                       const T* ZF_RESTRICT d_out,
                                                       T* ZF_RESTRICT dx,
                                                       const T* ZF_RESTRICT mask) {
-    Acc mean, rstd, n;
-    masked_row_stats(x, mask, &mean, &rstd, &n);
-    const T* ZF_RESTRICT g = gamma_.data();
-    Acc* ZF_RESTRICT dg = dgamma_.data();
-    Acc* ZF_RESTRICT db = dbeta_.data();
-    Acc sum_dg{}, sum_dg_xhat{};
-    for (std::size_t i = 0; i < Dim; ++i) {
-      if (mask[i] == T{}) continue;
-      const Acc xhat = (x[i] - mean) * rstd;
-      const Acc dgi = d_out[i] * g[i];
-      dg[i] += d_out[i] * xhat;
-      db[i] += d_out[i];
-      sum_dg += dgi;
-      sum_dg_xhat += dgi * xhat;
-    }
-    const Acc inv_n = n > Acc{} ? Acc{1} / n : Acc{};
-    for (std::size_t i = 0; i < Dim; ++i) {
-      if (mask[i] == T{}) {
-        dx[i] = T{};
-        continue;
-      }
-      const Acc xh = (x[i] - mean) * rstd;
-      const Acc dg_i = d_out[i] * g[i];
-      dx[i] = static_cast<T>(rstd * (dg_i - inv_n * sum_dg - xh * inv_n * sum_dg_xhat));
-    }
+    row_backward_masked(x, d_out, dx, mask, dgamma_.data(), dbeta_.data());
   }
 
   void zero_grad() {
@@ -1018,25 +1017,62 @@ class LayerNorm {
   // The mean, 1 / sqrt(var + eps) and count over the masked-in slots only.
   ZF_ALWAYS_INLINE void masked_row_stats(const T* ZF_RESTRICT x, const T* ZF_RESTRICT mask,
                                          Acc* mean, Acc* rstd, Acc* count) const {
-    Acc sum{}, n{};
-    for (std::size_t i = 0; i < Dim; ++i) {
-      if (mask[i] != T{}) {
-        sum += static_cast<Acc>(x[i]);
-        n += Acc{1};
-      }
+    Acc n = lane_sum([&](std::size_t i) { return load4(mask + i); });
+    Acc sum = lane_sum([&](std::size_t i) { return load4(mask + i) * load4(x + i); });
+    for (std::size_t i = kVec; i < Dim; ++i) {
+      const Acc m = static_cast<Acc>(mask[i]);
+      n += m;
+      sum += m * x[i];
     }
     const Acc m = n > Acc{} ? sum / n : Acc{};
-    Acc var{};
-    for (std::size_t i = 0; i < Dim; ++i) {
-      if (mask[i] != T{}) {
-        const Acc c = static_cast<Acc>(x[i]) - m;
-        var += c * c;
-      }
+    const V neg_m = splat(-m);
+    Acc var = lane_sum([&](std::size_t i) {
+      const V c = load4(x + i) + neg_m;
+      return load4(mask + i) * c * c;
+    });
+    for (std::size_t i = kVec; i < Dim; ++i) {
+      const Acc c = x[i] - m;
+      var += static_cast<Acc>(mask[i]) * c * c;
     }
     var = n > Acc{} ? var / n : Acc{};
     *mean = m;
     *rstd = Acc{1} / std::sqrt(var + eps_);
     *count = n;
+  }
+
+  // One masked row's backward (see normalize_row_masked), its dgamma and
+  // dbeta added into dg, db. dx is zero at absent slots.
+  ZF_ALWAYS_INLINE void row_backward_masked(const T* ZF_RESTRICT x, const T* ZF_RESTRICT d_out,
+                                            T* ZF_RESTRICT dx, const T* ZF_RESTRICT mask,
+                                            Acc* ZF_RESTRICT dg, Acc* ZF_RESTRICT db) const {
+    Acc mean, rstd, n;
+    masked_row_stats(x, mask, &mean, &rstd, &n);
+    const T* ZF_RESTRICT g = gamma_.data();
+    for (std::size_t i = 0; i < Dim; ++i) {
+      const Acc md = static_cast<Acc>(mask[i]) * d_out[i];
+      dg[i] += md * ((x[i] - mean) * rstd);
+      db[i] += md;
+    }
+    // m dy scaled by gamma, plus the two mean terms normalization couples in
+    const V neg_mean = splat(-mean), rstd_v = splat(rstd);
+    const auto dgi = [&](std::size_t i) {
+      return load4(mask + i) * load4(d_out + i) * load4(g + i);
+    };
+    const auto xhat = [&](std::size_t i) { return (load4(x + i) + neg_mean) * rstd_v; };
+    Acc sum_dg = lane_sum(dgi);
+    Acc sum_dg_xhat = lane_sum([&](std::size_t i) { return dgi(i) * xhat(i); });
+    for (std::size_t i = kVec; i < Dim; ++i) {
+      const Acc dgi = static_cast<Acc>(mask[i]) * d_out[i] * g[i];
+      sum_dg += dgi;
+      sum_dg_xhat += dgi * ((x[i] - mean) * rstd);
+    }
+    const Acc inv_n = n > Acc{} ? Acc{1} / n : Acc{};
+    const Acc a = inv_n * sum_dg, c = inv_n * sum_dg_xhat;
+    for (std::size_t i = 0; i < Dim; ++i) {
+      const Acc m = static_cast<Acc>(mask[i]);
+      const Acc xh = (x[i] - mean) * rstd;
+      dx[i] = static_cast<T>(m * rstd * (d_out[i] * g[i] - a - xh * c));
+    }
   }
 
   template <std::size_t Rows>

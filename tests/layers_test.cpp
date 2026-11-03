@@ -1,4 +1,6 @@
 #include <cmath>
+#include <random>
+#include <vector>
 #include <stdexcept>
 
 #include <gtest/gtest.h>
@@ -6,6 +8,7 @@
 #include "dot.h"
 #include "grad_check.h"
 #include "layers.h"
+#include "thread_pool.h"
 
 namespace {
 
@@ -265,6 +268,97 @@ TEST(LayerNorm, MaskedGradientsMatchFiniteDifferences) {
   EXPECT_EQ(dx(4), 0.0f);
   EXPECT_EQ(ln.gamma_grad()(1), 0.0);
   EXPECT_EQ(ln.beta_grad()(4), 0.0);
+}
+
+// Masked: the present slots are normalized among themselves; absent slots
+// come out zero, take no gradient and pass none back.
+TEST(LayerNorm, MaskedRowStacksAreTheirPresentSlots) {
+  auto gen = zf_test::rng();
+  zf::LayerNorm<float, 6> ln;
+  randomize_tensor(ln.gamma(), gen, 0.5);
+  randomize_tensor(ln.beta(), gen, 0.5);
+  for (std::size_t i = 0; i < 6; ++i) ln.gamma()(i) += 1.0f;
+  constexpr std::size_t kRows = 3;
+  zf::TensorF<kRows, 6> x, w;
+  randomize_tensor(x, gen);
+  randomize_tensor(w, gen);
+  // row 0 all present, row 1 present at 0, 2, 3, row 2 nothing present
+  const float mask[kRows * 6] = {1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0};
+
+  zf::TensorF<kRows, 6> y;
+  ln.forward_rows(x.data(), y.data(), kRows, mask);
+  zf::TensorF<6> y0;
+  ln.normalize_row(x.data(), y0.data());
+  for (std::size_t i = 0; i < 6; ++i) EXPECT_FLOAT_EQ(y(0, i), y0(i));
+  float mean = 0.0f, var = 0.0f;
+  for (std::size_t i : {0, 2, 3}) mean += x(1, i) / 3.0f;
+  for (std::size_t i : {0, 2, 3}) var += (x(1, i) - mean) * (x(1, i) - mean) / 3.0f;
+  for (std::size_t i = 0; i < 6; ++i) {
+    const float want = mask[6 + i] != 0.0f
+        ? ln.gamma()(i) * (x(1, i) - mean) / std::sqrt(var + 1e-5f) + ln.beta()(i)
+        : 0.0f;
+    EXPECT_NEAR(y(1, i), want, 1e-5f) << i;
+    EXPECT_EQ(y(2, i), 0.0f);
+  }
+
+  const auto loss = [&] {
+    zf::TensorF<kRows, 6> out;
+    ln.forward_rows(x.data(), out.data(), kRows, mask);
+    return zf::dot(out, w);
+  };
+  ln.zero_grad();
+  zf::TensorF<kRows, 6> dx;
+  ln.backward_rows(x.data(), w.data(), dx.data(), kRows, mask);
+  for (std::size_t i = 0; i < 6; ++i) {
+    if (mask[6 + i] == 0.0f) EXPECT_EQ(dx(1, i), 0.0f);
+    EXPECT_EQ(dx(2, i), 0.0f);
+  }
+  expect_grads_match(slots_of(ln.gamma()), values_of(ln.gamma_grad()), loss, "masked gamma");
+  expect_grads_match(slots_of(ln.beta()), values_of(ln.beta_grad()), loss, "masked beta");
+  expect_grads_match(slots_of(x), values_of(dx), loss, "masked input");
+}
+
+// Wide rows (the 16-lane blocks, the 4-lane leftovers and the scalar tail)
+// over a pool: a double-precision reference, and the same bits on any pool.
+TEST(LayerNorm, MaskedWideRowsOnAPool) {
+  constexpr std::size_t kDim = 87, kRows = 100;  // 80 + 4 + 3
+  auto gen = zf_test::rng();
+  zf::LayerNorm<float, kDim> ln;
+  randomize_tensor(ln.gamma(), gen, 0.5);
+  randomize_tensor(ln.beta(), gen, 0.5);
+  std::vector<float> x(kRows * kDim), d(kRows * kDim), mask(kRows * kDim);
+  std::uniform_real_distribution<float> u(-2.0f, 2.0f);
+  for (float& v : x) v = u(gen);
+  for (float& v : d) v = u(gen);
+  for (float& v : mask) v = u(gen) > -1.0f ? 1.0f : 0.0f;
+
+  std::vector<float> y(kRows * kDim), y1(kRows * kDim), dx(kRows * kDim), dx1(kRows * kDim);
+  zf::ThreadPool pool(4);
+  ln.forward_rows(x.data(), y.data(), kRows, mask.data(), &pool);
+  ln.forward_rows(x.data(), y1.data(), kRows, mask.data());
+  ln.zero_grad();
+  ln.backward_rows(x.data(), d.data(), dx.data(), kRows, mask.data(), &pool);
+  const std::vector<double> dg(ln.gamma_grad().data(), ln.gamma_grad().data() + kDim);
+  ln.zero_grad();
+  ln.backward_rows(x.data(), d.data(), dx1.data(), kRows, mask.data(), nullptr);
+  EXPECT_EQ(y, y1);
+  EXPECT_EQ(dx, dx1);
+  for (std::size_t i = 0; i < kDim; ++i) EXPECT_EQ(dg[i], ln.gamma_grad()(i));
+
+  for (std::size_t r = 0; r < kRows; ++r) {
+    const float* xr = x.data() + r * kDim;
+    const float* mr = mask.data() + r * kDim;
+    double n = 0, s = 0, v = 0;
+    for (std::size_t i = 0; i < kDim; ++i) n += mr[i], s += mr[i] * xr[i];
+    const double mean = s / n;
+    for (std::size_t i = 0; i < kDim; ++i) v += mr[i] * (xr[i] - mean) * (xr[i] - mean);
+    const double rstd = 1.0 / std::sqrt(v / n + 1e-5);
+    for (std::size_t i = 0; i < kDim; ++i) {
+      const double want = mr[i] * (ln.gamma()(i) * (xr[i] - mean) * rstd + ln.beta()(i));
+      ASSERT_NEAR(y[r * kDim + i], want, 1e-4) << r << " " << i;
+      if (mr[i] == 0.0f) ASSERT_EQ(dx[r * kDim + i], 0.0f);
+    }
+  }
 }
 
 TEST(Embedding, LookupAndScatterGrad) {
