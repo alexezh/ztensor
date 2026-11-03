@@ -10,6 +10,7 @@
 
 #include "blas.h"
 #include "tensor.h"
+#include "thread_pool.h"
 
 // Primitive layers shared by the models.
 //
@@ -348,22 +349,23 @@ class Linear {
     }
   }
 
-  // For R rows: accumulates dW and db, and adds each row's dx into `dx`.
+  // For R rows: accumulates dW and db into dw, db, and adds each row's dx
+  // into `dx`.
   // dx is built in a local block and added once at the end, so the inner
   // loop's read-modify-write stays in registers and L1.
   template <std::size_t R, typename W, typename X, typename G>
   ZF_ALWAYS_INLINE void matmul_rows_backward(const W* ZF_RESTRICT w,
                                              const X* ZF_RESTRICT x,
                                              const G* ZF_RESTRICT g,
-                                             T* ZF_RESTRICT dx) {
-    Acc* ZF_RESTRICT dw = dw_.data();
+                                             T* ZF_RESTRICT dx, Acc* ZF_RESTRICT dw,
+                                             Acc* ZF_RESTRICT db) {
     alignas(16) Acc local[R][InDim] = {};
     for (std::size_t o = 0; o < kVecOut; o += kBlock) {
       Acc gr[R][kBlock];
       for (std::size_t c = 0; c < kBlock; ++c) {
         for (std::size_t r = 0; r < R; ++r) {
           gr[r][c] = g[r * OutDim + o + c];
-          db_(o + c) += gr[r][c];
+          db[o + c] += gr[r][c];
         }
       }
       for (std::size_t i = 0; i < kVecIn; i += kLanes) {
@@ -405,7 +407,7 @@ class Linear {
         const W* ZF_RESTRICT wo = w + o * InDim;
         for (std::size_t r = 0; r < R; ++r) {
           const Acc gv = g[r * OutDim + o];
-          db_(o) += gv;
+          db[o] += gv;
           for (std::size_t i = 0; i < InDim; ++i) {
             dwo[i] += gv * x[r * InDim + i];
             local[r][i] += gv * wo[i];
@@ -443,7 +445,7 @@ class Linear {
   Tensor<T, InDim> backward(const Tensor<T, InDim>& x,
                             const Tensor<T, OutDim>& d_out) {
     Tensor<T, InDim> dx;
-    matmul_rows_backward<1>(w_.data(), x.data(), d_out.data(), dx.data());
+    matmul_rows_backward<1>(w_.data(), x.data(), d_out.data(), dx.data(), dw_.data(), db_.data());
     return dx;
   }
 
@@ -495,6 +497,27 @@ class Linear {
         return;
       }
     }
+    if (split_kernels(rows)) {
+      parallel_for(&ThreadPool::global(), rows, kSplitRows,
+                   [&](std::size_t, std::size_t r0, std::size_t r1) {
+                     forward_kernels(x + r0 * InDim, out + r0 * OutDim, r1 - r0);
+                   });
+      return;
+    }
+    forward_kernels(x, out, rows);
+  }
+
+  // Without the GEMM, a large stack splits its rows over
+  // ThreadPool::global() in chunks of kSplitRows: forward is the same row by
+  // row; backward sums each chunk's dW and db apart and adds them in chunk
+  // order, so the result depends on the rows, not on the threads.
+  static constexpr std::size_t kSplitRows = 64;
+  static bool split_kernels(std::size_t rows) {
+    return rows > kSplitRows && rows * InDim * OutDim >= blas::kSplitWork &&
+           !ThreadPool::on_worker() && ThreadPool::global().participants() > 1;
+  }
+
+  void forward_kernels(const T* x, T* out, std::size_t rows) const {
     if constexpr (kStorageType) {
       if (rows >= kWidenMinRows) {
         forward_widened(x, out, rows);
@@ -557,20 +580,42 @@ class Linear {
         return;
       }
     }
+    if (split_kernels(rows)) {
+      const std::size_t chunks = chunk_count(rows, kSplitRows);
+      constexpr std::size_t kPart = OutDim * InDim + OutDim;
+      std::vector<Acc> part(chunks * kPart, Acc{});
+      parallel_for(&ThreadPool::global(), rows, kSplitRows,
+                   [&](std::size_t c, std::size_t r0, std::size_t r1) {
+                     Acc* dw = part.data() + c * kPart;
+                     backward_kernels(x + r0 * InDim, d_out + r0 * OutDim, dx + r0 * InDim,
+                                      r1 - r0, dw, dw + OutDim * InDim);
+                   });
+      for (std::size_t c = 0; c < chunks; ++c) {
+        const Acc* p = part.data() + c * kPart;
+        for (std::size_t i = 0; i < OutDim * InDim; ++i) dw_.data()[i] += p[i];
+        for (std::size_t o = 0; o < OutDim; ++o) db_(o) += p[OutDim * InDim + o];
+      }
+      return;
+    }
+    backward_kernels(x, d_out, dx, rows, dw_.data(), db_.data());
+  }
+
+  void backward_kernels(const T* x, const T* d_out, T* dx, std::size_t rows, Acc* dw,
+                        Acc* db) {
     if constexpr (kStorageType) {
       if (rows >= kWidenMinRows) {
-        backward_widened(x, d_out, dx, rows);
+        backward_widened(x, d_out, dx, rows, dw, db);
         return;
       }
     }
     std::size_t r = 0;
     for (; r + kRowBlock <= rows; r += kRowBlock) {
       matmul_rows_backward<kRowBlock>(w_.data(), x + r * InDim, d_out + r * OutDim,
-                                      dx + r * InDim);
+                                      dx + r * InDim, dw, db);
     }
     for (; r < rows; ++r) {
       matmul_rows_backward<1>(w_.data(), x + r * InDim, d_out + r * OutDim,
-                              dx + r * InDim);
+                              dx + r * InDim, dw, db);
     }
   }
 
@@ -600,7 +645,8 @@ class Linear {
     for (; r < rows; ++r) matmul_rows<1>(wf, x + r * InDim, out + r * OutDim);
   }
 
-  void backward_widened(const T* x, const T* d_out, T* dx, std::size_t rows) {
+  void backward_widened(const T* x, const T* d_out, T* dx, std::size_t rows, Acc* dw,
+                        Acc* db) {
     Acc* wf = detail::widen_scratch<Acc>(0, OutDim * InDim);
     widen_into(w_.data(), wf, OutDim * InDim);
     if constexpr (blas::kEnabled) {
@@ -611,8 +657,7 @@ class Linear {
         widen_into(x, xf, rows * InDim);
         widen_into(d_out, gf, rows * OutDim);
         widen_into(dx, dxf, rows * InDim);
-        blas::linear_backward(xf, gf, wf, dxf, dw_.data(), db_.data(), rows,
-                              InDim, OutDim);
+        blas::linear_backward(xf, gf, wf, dxf, dw, db, rows, InDim, OutDim);
         narrow_into(dxf, dx, rows * InDim);
         return;
       }
@@ -623,10 +668,10 @@ class Linear {
     for (; r + kRowBlock <= rows; r += kRowBlock) {
       widen_into(x + r * InDim, xb, kRowBlock * InDim);
       widen_into(d_out + r * OutDim, gb, kRowBlock * OutDim);
-      matmul_rows_backward<kRowBlock>(wf, xb, gb, dx + r * InDim);
+      matmul_rows_backward<kRowBlock>(wf, xb, gb, dx + r * InDim, dw, db);
     }
     for (; r < rows; ++r) {
-      matmul_rows_backward<1>(wf, x + r * InDim, d_out + r * OutDim, dx + r * InDim);
+      matmul_rows_backward<1>(wf, x + r * InDim, d_out + r * OutDim, dx + r * InDim, dw, db);
     }
   }
 
@@ -771,11 +816,56 @@ class LayerNorm {
   ZF_ALWAYS_INLINE void normalize_row_backward(const T* ZF_RESTRICT x,
                                               const T* ZF_RESTRICT d_out,
                                               T* ZF_RESTRICT dx) {
+    row_backward(x, d_out, dx, dgamma_.data(), dbeta_.data());
+  }
+
+  // A stack of `rows` rows (raw, Dim each), split over `pool` in chunks of
+  // kRowGrain rows; nullptr runs them here. forward_rows overwrites out.
+  void forward_rows(const T* x, T* out, std::size_t rows, ThreadPool* pool = nullptr) const {
+    parallel_for(pool, rows, kRowGrain, [&](std::size_t, std::size_t r0, std::size_t r1) {
+      for (std::size_t r = r0; r < r1; ++r) normalize_row(x + r * Dim, out + r * Dim);
+    });
+  }
+
+  // Overwrites dx; adds into the parameter gradients. Each chunk sums its
+  // own dgamma, dbeta, added in chunk order afterwards, so the result is the
+  // same on any pool (the chunks depend only on `rows`).
+  void backward_rows(const T* x, const T* d_out, T* dx, std::size_t rows,
+                     ThreadPool* pool = nullptr) {
+    const std::size_t chunks = chunk_count(rows, kRowGrain);
+    if (chunks <= 1) {
+      for (std::size_t r = 0; r < rows; ++r) {
+        normalize_row_backward(x + r * Dim, d_out + r * Dim, dx + r * Dim);
+      }
+      return;
+    }
+    std::vector<Acc> part(chunks * 2 * Dim, Acc{});
+    parallel_for(pool, rows, kRowGrain, [&](std::size_t c, std::size_t r0, std::size_t r1) {
+      Acc* dg = part.data() + c * 2 * Dim;
+      for (std::size_t r = r0; r < r1; ++r) {
+        row_backward(x + r * Dim, d_out + r * Dim, dx + r * Dim, dg, dg + Dim);
+      }
+    });
+    for (std::size_t c = 0; c < chunks; ++c) {
+      const Acc* dg = part.data() + c * 2 * Dim;
+      for (std::size_t i = 0; i < Dim; ++i) {
+        dgamma_(i) += dg[i];
+        dbeta_(i) += dg[Dim + i];
+      }
+    }
+  }
+
+  // Rows per chunk when a stack is split over threads.
+  static constexpr std::size_t kRowGrain = 32;
+
+ private:
+  // One row's backward, its dgamma and dbeta added into dg, db.
+  ZF_ALWAYS_INLINE void row_backward(const T* ZF_RESTRICT x, const T* ZF_RESTRICT d_out,
+                                     T* ZF_RESTRICT dx, Acc* ZF_RESTRICT dg,
+                                     Acc* ZF_RESTRICT db) {
     Acc mean, rstd;
     row_stats(x, &mean, &rstd);
     const T* ZF_RESTRICT g = gamma_.data();
-    Acc* ZF_RESTRICT dg = dgamma_.data();
-    Acc* ZF_RESTRICT db = dbeta_.data();
     for (std::size_t i = 0; i < Dim; ++i) {
       const Acc xhat = (x[i] - mean) * rstd;
       dg[i] += d_out[i] * xhat;
@@ -800,6 +890,7 @@ class LayerNorm {
     }
   }
 
+ public:
   void zero_grad() {
     dgamma_.fill(Acc{});
     dbeta_.fill(Acc{});

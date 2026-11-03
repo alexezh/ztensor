@@ -36,11 +36,14 @@ add_library(ztensor
   src/query_model.cpp
   src/loss.cpp
   src/blas.cpp
+  src/thread_pool.cpp
 )
 target_include_directories(ztensor PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
 )
 target_compile_options(ztensor PRIVATE ${ZTENSOR_WARNINGS})
+find_package(Threads REQUIRED)
+target_link_libraries(ztensor PUBLIC Threads::Threads)
 if(ZTENSOR_CHECK_FINITE)
   target_compile_definitions(ztensor PUBLIC ZTENSOR_CHECK_FINITE)
 endif()
@@ -80,6 +83,7 @@ if(ZTENSOR_BUILD_TESTS)
     tests/loss_test.cpp
     tests/batch_test.cpp
     tests/bf16_test.cpp
+    tests/thread_pool_test.cpp
   )
   target_include_directories(ztensor_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   target_link_libraries(ztensor_tests PRIVATE ztensor GTest::gtest_main)

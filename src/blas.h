@@ -11,6 +11,10 @@
 // All matrices are row-major and densely packed; the calls are tiny next to
 // the GEMM behind them.
 
+namespace zf {
+class ThreadPool;
+}
+
 namespace zf::blas {
 
 #if defined(ZF_USE_ACCELERATE)
@@ -49,6 +53,24 @@ constexpr std::size_t gemm_rows(std::size_t k, std::size_t n) {
   const std::size_t by_work = (kMinWork + k * n - 1) / (k * n);
   return by_work > kMinRows ? by_work : kMinRows;
 }
+
+// Large calls split over the matrix units, one part each. Apple Silicon has
+// one per performance cluster (an M2 Max two, an M2 one, an Ultra four); a
+// second thread on the same cluster shares its unit and only adds
+// contention. Measured on an M2 Max, 224 rows of 354 -> 64: one call 21 us,
+// two parts on two threads 13 us, four or eight parts 20 us or worse.
+// Forward splits the rows; backward splits dx by rows and dw, db by output
+// columns, so no part adds into another's sums and each element is still one
+// GEMM. The parts run on `pool()`: unless set, a pool of its own with one
+// thread per matrix unit (with ThreadPool::global()'s dozen threads a part
+// lands as often on an efficiency core, or beside the caller, and the
+// split gains nothing).
+inline constexpr std::size_t kSplitWork = std::size_t{2} * 1024 * 1024;
+
+std::size_t matrix_units();
+// nullptr: never split.
+void set_pool(ThreadPool* pool);
+ThreadPool* pool();
 
 // out[rows, n] = x[rows, k] * w[n, k]^T + b[n]. Overwrites out.
 void linear_forward(const float* x, const float* w, const float* b, float* out,

@@ -27,12 +27,12 @@ Other options:
 - `-DZTENSOR_NATIVE=ON` compiles for the build machine's CPU (`-march=native`).
   It matters on x86, where the default baseline is SSE2; arm64's baseline
   already has NEON.
-- `-DZTENSOR_ACCELERATE=ON` (the default on Apple) sends tall float stacks
-  (64+ rows, i.e. row-stacked batches) through Accelerate's SGEMM. On Apple
-  Silicon it makes a 64-example decoder step about 1.4x faster. Shorter
-  stacks keep the inline kernels, so single sequences are unchanged. The
-  GEMM sums in its own order, so batched results can differ from one example
-  at a time in the last bits. Turn it off for bit-exact batching.
+- `-DZTENSOR_ACCELERATE=ON` (the default on Apple) sends float stacks with
+  enough work (at least 4 rows and 128K multiply-adds, `blas::use_gemm`)
+  through Accelerate's SGEMM. On Apple Silicon it makes a 64-example decoder
+  step about 1.4x faster; narrow single sequences keep the inline kernels.
+  The GEMM sums in its own order, so batched results can differ from one
+  example at a time in the last bits. Turn it off for bit-exact batching.
 - `-DZTENSOR_CHECK_FINITE=ON` is a debug check. It throws
   `std::runtime_error` at the first NaN or infinity after any block's forward
   or backward pass. `zf::all_finite(t)` is available for your own checks.
@@ -118,7 +118,39 @@ sizes. Small layers already run in 4-row blocks, so time per example stays
 flat from a batch size of 1 to 64. With Accelerate (the default on Apple), the
 batch's projections become tall matrix multiplies and a 64-example step runs
 about 1.4x faster. Batching also lets you average gradients over many examples,
-and a later multi-threaded trainer could split a batch across cores.
+and the threads below split a batch across cores.
+
+## Threads
+
+`zf::ThreadPool` (`thread_pool.h`) runs the library's data-parallel loops.
+Work goes as items through one lock-free queue per worker; the caller works
+too, and `Completion` tells it when its items are done. Idle workers spin
+briefly, then sleep on an atomic.
+
+```cpp
+zf::parallel_for(&zf::ThreadPool::global(), rows, /*grain=*/32,
+                 [&](std::size_t chunk, std::size_t begin, std::size_t end) {
+                   // rows [begin, end); `chunk` indexes per-chunk partials
+                 });
+```
+
+Chunks depend only on the size and the grain, never on the thread count, so
+a loop that keeps per-chunk partial sums and adds them in chunk order gives
+the same bits on one thread or twelve. What uses it:
+
+- `LayerNorm::forward_rows` / `backward_rows` split a row stack.
+- Large Linear calls on the inline kernels (no Accelerate, double, bf16)
+  split their rows; backward sums dW per chunk.
+- With Accelerate, a large GEMM splits into one part per matrix unit (one
+  per performance cluster: two on an M2 Max), on a small pool of its own.
+  More parts than units only contend: 224 x 354 -> 64 takes 21 us as one
+  call, 13 us as two, 20 us or more as four or eight.
+
+`ThreadPool::global()` takes most of the machine: on Apple the performance
+cores less one (efficiency cores make stragglers in a fork-join loop;
+workers run at the user-interactive QoS class); elsewhere every CPU the
+process may use, less one. `ZF_THREADS=n` overrides it, and `ZF_THREADS=1`
+keeps everything on the calling thread.
 
 ## bf16
 
