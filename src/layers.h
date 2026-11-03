@@ -891,6 +891,61 @@ class LayerNorm {
   }
 
  public:
+  // Masked LayerNorm: the statistics are taken over only the slots whose
+  // mask is set, and masked-out slots are driven to zero on the output.
+  //
+  //   N = sum_i m_i,   mu = (sum_i m_i x_i) / N,
+  //   s = sqrt((sum_i m_i (x_i - mu)^2) / N + eps),
+  //   out_i = m_i (gamma_i (x_i - mu) / s + beta_i)
+  //
+  // A masked-out slot enters neither the statistics nor any output, so its
+  // input gradient is exactly zero -- unlike gating the output of a plain
+  // LayerNorm, which leaves a nonzero gradient at the norm's input. For a
+  // sparse token (most slots absent) this keeps absent slots from leaking a
+  // row-dependent bias into whatever reads the normalized vector.
+  ZF_ALWAYS_INLINE void normalize_row_masked(const T* ZF_RESTRICT x,
+                                             T* ZF_RESTRICT out,
+                                             const T* ZF_RESTRICT mask) const {
+    Acc mean, rstd, n;
+    masked_row_stats(x, mask, &mean, &rstd, &n);
+    const T* ZF_RESTRICT g = gamma_.data();
+    const T* ZF_RESTRICT b = beta_.data();
+    for (std::size_t i = 0; i < Dim; ++i) {
+      out[i] = mask[i] != T{} ? static_cast<T>(g[i] * (x[i] - mean) * rstd + b[i]) : T{};
+    }
+  }
+
+  ZF_ALWAYS_INLINE void normalize_row_masked_backward(const T* ZF_RESTRICT x,
+                                                      const T* ZF_RESTRICT d_out,
+                                                      T* ZF_RESTRICT dx,
+                                                      const T* ZF_RESTRICT mask) {
+    Acc mean, rstd, n;
+    masked_row_stats(x, mask, &mean, &rstd, &n);
+    const T* ZF_RESTRICT g = gamma_.data();
+    Acc* ZF_RESTRICT dg = dgamma_.data();
+    Acc* ZF_RESTRICT db = dbeta_.data();
+    Acc sum_dg{}, sum_dg_xhat{};
+    for (std::size_t i = 0; i < Dim; ++i) {
+      if (mask[i] == T{}) continue;
+      const Acc xhat = (x[i] - mean) * rstd;
+      const Acc dgi = d_out[i] * g[i];
+      dg[i] += d_out[i] * xhat;
+      db[i] += d_out[i];
+      sum_dg += dgi;
+      sum_dg_xhat += dgi * xhat;
+    }
+    const Acc inv_n = n > Acc{} ? Acc{1} / n : Acc{};
+    for (std::size_t i = 0; i < Dim; ++i) {
+      if (mask[i] == T{}) {
+        dx[i] = T{};
+        continue;
+      }
+      const Acc xh = (x[i] - mean) * rstd;
+      const Acc dg_i = d_out[i] * g[i];
+      dx[i] = static_cast<T>(rstd * (dg_i - inv_n * sum_dg - xh * inv_n * sum_dg_xhat));
+    }
+  }
+
   void zero_grad() {
     dgamma_.fill(Acc{});
     dbeta_.fill(Acc{});
@@ -958,6 +1013,30 @@ class LayerNorm {
     var /= static_cast<Acc>(Dim);
     *mean = m;
     *rstd = Acc{1} / std::sqrt(var + eps_);
+  }
+
+  // The mean, 1 / sqrt(var + eps) and count over the masked-in slots only.
+  ZF_ALWAYS_INLINE void masked_row_stats(const T* ZF_RESTRICT x, const T* ZF_RESTRICT mask,
+                                         Acc* mean, Acc* rstd, Acc* count) const {
+    Acc sum{}, n{};
+    for (std::size_t i = 0; i < Dim; ++i) {
+      if (mask[i] != T{}) {
+        sum += static_cast<Acc>(x[i]);
+        n += Acc{1};
+      }
+    }
+    const Acc m = n > Acc{} ? sum / n : Acc{};
+    Acc var{};
+    for (std::size_t i = 0; i < Dim; ++i) {
+      if (mask[i] != T{}) {
+        const Acc c = static_cast<Acc>(x[i]) - m;
+        var += c * c;
+      }
+    }
+    var = n > Acc{} ? var / n : Acc{};
+    *mean = m;
+    *rstd = Acc{1} / std::sqrt(var + eps_);
+    *count = n;
   }
 
   template <std::size_t Rows>
@@ -1153,6 +1232,35 @@ void softmax_inplace(T* ZF_RESTRICT row, std::size_t n) {
       row[j] *= inv;
     }
   }
+}
+
+// --- readouts ----------------------------------------------------------------
+
+inline float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
+
+// Softmax probabilities over the first `n` of a logit tensor's C classes.
+template <typename T, std::size_t C>
+std::array<float, C> softmax(const Tensor<T, C>& logits, std::size_t n = C) {
+  std::array<float, C> p{};
+  T max_logit = logits(0);
+  for (std::size_t i = 1; i < n; ++i) max_logit = std::max(max_logit, logits(i));
+  float sum = 0.0f;
+  for (std::size_t i = 0; i < n; ++i) {
+    p[i] = std::exp(static_cast<float>(logits(i) - max_logit));
+    sum += p[i];
+  }
+  for (std::size_t i = 0; i < n; ++i) p[i] /= sum;
+  return p;
+}
+
+// The index of the largest of the first `n` logits.
+template <typename T, std::size_t C>
+std::size_t argmax(const Tensor<T, C>& logits, std::size_t n = C) {
+  std::size_t best = 0;
+  for (std::size_t i = 1; i < n; ++i) {
+    if (logits(i) > logits(best)) best = i;
+  }
+  return best;
 }
 
 }  // namespace zf

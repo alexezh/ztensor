@@ -320,6 +320,32 @@ decltype(auto) as_tensor_of(const Tensor<From, Dims...>& t) {
   }
 }
 
+// --- small tensor helpers ----------------------------------------------------
+
+template <typename T, std::size_t N>
+Tensor<T, N> to_tensor(const std::array<float, N>& a) {
+  Tensor<T, N> t;
+  for (std::size_t i = 0; i < N; ++i) t(i) = static_cast<T>(a[i]);
+  return t;
+}
+
+template <typename T, std::size_t R, std::size_t D>
+Tensor<T, D> row_of(const Tensor<T, R, D>& m, std::size_t r) {
+  Tensor<T, D> v;
+  for (std::size_t d = 0; d < D; ++d) v(d) = m(r, d);
+  return v;
+}
+
+template <typename T, std::size_t R, std::size_t D>
+void add_row(Tensor<T, R, D>* m, std::size_t r, const Tensor<T, D>& v) {
+  for (std::size_t d = 0; d < D; ++d) (*m)(r, d) += v(d);
+}
+
+template <typename T, std::size_t R, std::size_t D>
+void put_row(Tensor<T, R, D>* m, std::size_t r, const Tensor<T, D>& v) {
+  for (std::size_t d = 0; d < D; ++d) (*m)(r, d) = v(d);
+}
+
 [[noreturn]] void throw_not_finite(const char* what);
 
 // Debug check after each major step: with ZTENSOR_CHECK_FINITE defined (the

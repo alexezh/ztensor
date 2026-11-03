@@ -13,6 +13,42 @@
 
 namespace zf {
 
+// Free-function losses for logits that are read a few classes at a time, where
+// the valid class count `n` is a runtime value (a memory length, an item count)
+// rather than the tensor width. The class-based losses below fuse softmax into
+// the loss over the full width; these take `n` and leave the rest untouched.
+
+// Softmax cross entropy over the first `n` classes; the rest get no gradient.
+template <typename T, std::size_t C>
+double softmax_ce(const Tensor<T, C>& logits, std::size_t label, std::size_t n,
+                  Tensor<T, C>* d_logits) {
+  T max_logit = logits(0);
+  for (std::size_t i = 1; i < n; ++i) max_logit = std::max(max_logit, logits(i));
+  T sum{};
+  for (std::size_t i = 0; i < n; ++i) sum += std::exp(logits(i) - max_logit);
+  const T log_sum = std::log(sum);
+  if (d_logits != nullptr) {
+    d_logits->fill(T{});
+    for (std::size_t i = 0; i < n; ++i) {
+      (*d_logits)(i) = std::exp(logits(i) - max_logit - log_sum);
+    }
+    (*d_logits)(label) -= T{1};
+  }
+  return static_cast<double>(-(logits(label) - max_logit - log_sum));
+}
+
+// Binary cross entropy on a logit, in double whatever T is; *d gets
+// dL/dlogit.
+template <typename T>
+double bce(T logit, bool label, T* d) {
+  const double z = static_cast<double>(logit);
+  const double p = 1.0 / (1.0 + std::exp(-z));
+  *d = static_cast<T>(p - (label ? 1.0 : 0.0));
+  // log(sigmoid(z)) = -log1p(exp(-z)), computed stably on both sides.
+  const double y = label ? z : -z;
+  return y > 0 ? std::log1p(std::exp(-y)) : -y + std::log1p(std::exp(y));
+}
+
 // Losses follow the same two-step shape as the models: forward() returns the
 // scalar loss and caches what it needs, backward() returns dL/d(prediction) to
 // hand straight to a model's backward().

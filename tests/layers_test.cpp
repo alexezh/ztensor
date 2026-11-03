@@ -215,6 +215,58 @@ TEST(LayerNorm, SequenceGradientsMatchFiniteDifferences) {
   expect_grads_match(slots_of(x), values_of(dx), loss, "layernorm seq input");
 }
 
+TEST(LayerNorm, MaskedStatisticsUseOnlyIncludedSlots) {
+  // The masked norm over the included slots equals a plain norm over just
+  // those slots, and the excluded slots come out zero.
+  zf::LayerNorm<float, 6> ln;
+  const zf::TensorF<6> x{1, 2, 99, 3, 99, 4};
+  const zf::TensorF<6> mask{1, 1, 0, 1, 0, 1};  // the 99s are excluded
+  zf::TensorF<6> out;
+  ln.normalize_row_masked(x.data(), out.data(), mask.data());
+
+  float mean = (out(0) + out(1) + out(3) + out(5)) / 4.0f;
+  float var = 0.0f;
+  for (std::size_t i : {0u, 1u, 3u, 5u}) var += (out(i) - mean) * (out(i) - mean);
+  var /= 4.0f;
+  EXPECT_NEAR(mean, 0.0f, 1e-5f);
+  EXPECT_NEAR(var, 1.0f, 1e-4f);
+  EXPECT_EQ(out(2), 0.0f);
+  EXPECT_EQ(out(4), 0.0f);
+}
+
+TEST(LayerNorm, MaskedGradientsMatchFiniteDifferences) {
+  auto gen = zf_test::rng();
+  zf::LayerNorm<float, 6> ln;
+  randomize_tensor(ln.gamma(), gen, 0.5);
+  randomize_tensor(ln.beta(), gen, 0.5);
+  for (std::size_t i = 0; i < 6; ++i) ln.gamma()(i) += 1.0f;
+  zf::TensorF<6> x, w;
+  randomize_tensor(x, gen);
+  randomize_tensor(w, gen);
+  const zf::TensorF<6> mask{1, 0, 1, 1, 0, 1};
+
+  const auto loss = [&] {
+    zf::TensorF<6> out;
+    ln.normalize_row_masked(x.data(), out.data(), mask.data());
+    return zf::dot(out, w);
+  };
+
+  ln.zero_grad();
+  zf::TensorF<6> dx;
+  ln.normalize_row_masked_backward(x.data(), w.data(), dx.data(), mask.data());
+
+  expect_grads_match(slots_of(ln.gamma()), values_of(ln.gamma_grad()), loss, "masked gamma");
+  expect_grads_match(slots_of(ln.beta()), values_of(ln.beta_grad()), loss, "masked beta");
+  expect_grads_match(slots_of(x), values_of(dx), loss, "masked input");
+
+  // The defining property: an excluded slot enters neither the statistics nor
+  // the output, so its input gradient is exactly zero -- not merely small.
+  EXPECT_EQ(dx(1), 0.0f);
+  EXPECT_EQ(dx(4), 0.0f);
+  EXPECT_EQ(ln.gamma_grad()(1), 0.0);
+  EXPECT_EQ(ln.beta_grad()(4), 0.0);
+}
+
 TEST(Embedding, LookupAndScatterGrad) {
   zf::Embedding<float, 5, 3> emb;
   emb.weight()(2, 0) = 1.0f;
