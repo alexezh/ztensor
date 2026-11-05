@@ -695,6 +695,9 @@ class Linear {
   const BiasTensor& bias() const { return b_; }
   const WeightGradTensor& weight_grad() const { return dw_; }
   const BiasGradTensor& bias_grad() const { return db_; }
+  // Writable for a trainer that sums gradients from elsewhere (replicas).
+  WeightGradTensor& weight_grad() { return dw_; }
+  BiasGradTensor& bias_grad() { return db_; }
 
  private:
   WeightTensor w_;
@@ -853,6 +856,51 @@ class LayerNorm {
         row_backward(x + r * Dim, d_out + r * Dim, dx + r * Dim, dg, db);
       }
     };
+    rows_backward(rows, pool, row);
+  }
+
+  // Masked rows' statistics. They depend on the row and its mask (and eps),
+  // not on gamma and beta, so they can be computed once for rows that
+  // several LayerNorms normalize, and kept from forward for backward.
+  struct RowStats {
+    Acc mean, rstd, n;
+  };
+  void stats_rows(const T* x, const T* mask, std::size_t rows, RowStats* stats,
+                  ThreadPool* pool = nullptr) const {
+    parallel_for(pool, rows, kRowGrain, [&](std::size_t, std::size_t r0, std::size_t r1) {
+      for (std::size_t r = r0; r < r1; ++r) {
+        masked_row_stats(x + r * Dim, mask + r * Dim, &stats[r].mean, &stats[r].rstd, &stats[r].n);
+      }
+    });
+  }
+  // The masked forward_rows and backward_rows from stats_rows (same eps):
+  // the same results, without recomputing the statistics.
+  void forward_rows_from(const RowStats* stats, const T* x, T* out, std::size_t rows,
+                         const T* mask, ThreadPool* pool = nullptr) const {
+    parallel_for(pool, rows, kRowGrain, [&](std::size_t, std::size_t r0, std::size_t r1) {
+      for (std::size_t r = r0; r < r1; ++r) {
+        normalize_row_masked(x + r * Dim, out + r * Dim, mask + r * Dim, stats[r].mean,
+                             stats[r].rstd);
+      }
+    });
+  }
+  void backward_rows_from(const RowStats* stats, const T* x, const T* d_out, T* dx,
+                          std::size_t rows, const T* mask, ThreadPool* pool = nullptr) {
+    const auto row = [&](std::size_t r, Acc* dg, Acc* db) {
+      row_backward_masked(x + r * Dim, d_out + r * Dim, dx + r * Dim, mask + r * Dim, stats[r], dg,
+                          db);
+    };
+    rows_backward(rows, pool, row);
+  }
+
+  // Rows per chunk when a stack is split over threads.
+  static constexpr std::size_t kRowGrain = 32;
+
+ private:
+  // row(r, dg, db) for every row: each chunk sums its own dgamma, dbeta,
+  // added in chunk order afterwards.
+  template <typename Row>
+  void rows_backward(std::size_t rows, ThreadPool* pool, const Row& row) {
     const std::size_t chunks = chunk_count(rows, kRowGrain);
     if (chunks <= 1) {
       for (std::size_t r = 0; r < rows; ++r) row(r, dgamma_.data(), dbeta_.data());
@@ -872,10 +920,6 @@ class LayerNorm {
     }
   }
 
-  // Rows per chunk when a stack is split over threads.
-  static constexpr std::size_t kRowGrain = 32;
-
- private:
   // One row's backward, its dgamma and dbeta added into dg, db.
   ZF_ALWAYS_INLINE void row_backward(const T* ZF_RESTRICT x, const T* ZF_RESTRICT d_out,
                                      T* ZF_RESTRICT dx, Acc* ZF_RESTRICT dg,
@@ -930,6 +974,11 @@ class LayerNorm {
                                              const T* ZF_RESTRICT mask) const {
     Acc mean, rstd, n;
     masked_row_stats(x, mask, &mean, &rstd, &n);
+    normalize_row_masked(x, out, mask, mean, rstd);
+  }
+  ZF_ALWAYS_INLINE void normalize_row_masked(const T* ZF_RESTRICT x, T* ZF_RESTRICT out,
+                                             const T* ZF_RESTRICT mask, Acc mean,
+                                             Acc rstd) const {
     const T* ZF_RESTRICT g = gamma_.data();
     const T* ZF_RESTRICT b = beta_.data();
     for (std::size_t i = 0; i < Dim; ++i) {
@@ -963,6 +1012,9 @@ class LayerNorm {
   const Tensor<T, Dim>& beta() const { return beta_; }
   const Tensor<Acc, Dim>& gamma_grad() const { return dgamma_; }
   const Tensor<Acc, Dim>& beta_grad() const { return dbeta_; }
+  // Writable for a trainer that sums gradients from elsewhere (replicas).
+  Tensor<Acc, Dim>& gamma_grad() { return dgamma_; }
+  Tensor<Acc, Dim>& beta_grad() { return dbeta_; }
 
  private:
   static constexpr std::size_t kLanes = 4;
@@ -986,6 +1038,35 @@ class LayerNorm {
     V a = (a0 + a1) + (a2 + a3);
     for (std::size_t i = kVecBlock; i < kVec; i += kLanes) a += term(i);
     return hsum4(a);
+  }
+
+  // Two lane_sums in one pass: term(i, &a, &b) gives both terms; each sum
+  // adds in the same order lane_sum would.
+  template <typename Term>
+  static ZF_ALWAYS_INLINE void lane_sum2(Term&& term, Acc* sa, Acc* sb) {
+    V a0{}, a1{}, a2{}, a3{}, b0{}, b1{}, b2{}, b3{}, ta, tb;
+    for (std::size_t i = 0; i < kVecBlock; i += kBlock) {
+      term(i, &ta, &tb);
+      a0 += ta;
+      b0 += tb;
+      term(i + kLanes, &ta, &tb);
+      a1 += ta;
+      b1 += tb;
+      term(i + 2 * kLanes, &ta, &tb);
+      a2 += ta;
+      b2 += tb;
+      term(i + 3 * kLanes, &ta, &tb);
+      a3 += ta;
+      b3 += tb;
+    }
+    V a = (a0 + a1) + (a2 + a3), b = (b0 + b1) + (b2 + b3);
+    for (std::size_t i = kVecBlock; i < kVec; i += kLanes) {
+      term(i, &ta, &tb);
+      a += ta;
+      b += tb;
+    }
+    *sa = hsum4(a);
+    *sb = hsum4(b);
   }
 
   static ZF_ALWAYS_INLINE V splat(Acc a) {
@@ -1047,20 +1128,24 @@ class LayerNorm {
                                             Acc* ZF_RESTRICT dg, Acc* ZF_RESTRICT db) const {
     Acc mean, rstd, n;
     masked_row_stats(x, mask, &mean, &rstd, &n);
+    row_backward_masked(x, d_out, dx, mask, {mean, rstd, n}, dg, db);
+  }
+  ZF_ALWAYS_INLINE void row_backward_masked(const T* ZF_RESTRICT x, const T* ZF_RESTRICT d_out,
+                                            T* ZF_RESTRICT dx, const T* ZF_RESTRICT mask,
+                                            const RowStats& st, Acc* ZF_RESTRICT dg,
+                                            Acc* ZF_RESTRICT db) const {
+    const Acc mean = st.mean, rstd = st.rstd, n = st.n;
     const T* ZF_RESTRICT g = gamma_.data();
-    for (std::size_t i = 0; i < Dim; ++i) {
-      const Acc md = static_cast<Acc>(mask[i]) * d_out[i];
-      dg[i] += md * ((x[i] - mean) * rstd);
-      db[i] += md;
-    }
     // m dy scaled by gamma, plus the two mean terms normalization couples in
     const V neg_mean = splat(-mean), rstd_v = splat(rstd);
-    const auto dgi = [&](std::size_t i) {
-      return load4(mask + i) * load4(d_out + i) * load4(g + i);
-    };
-    const auto xhat = [&](std::size_t i) { return (load4(x + i) + neg_mean) * rstd_v; };
-    Acc sum_dg = lane_sum(dgi);
-    Acc sum_dg_xhat = lane_sum([&](std::size_t i) { return dgi(i) * xhat(i); });
+    Acc sum_dg, sum_dg_xhat;
+    lane_sum2(
+        [&](std::size_t i, V* a, V* b) {
+          const V dgi = load4(mask + i) * load4(d_out + i) * load4(g + i);
+          *a = dgi;
+          *b = dgi * ((load4(x + i) + neg_mean) * rstd_v);
+        },
+        &sum_dg, &sum_dg_xhat);
     for (std::size_t i = kVec; i < Dim; ++i) {
       const Acc dgi = static_cast<Acc>(mask[i]) * d_out[i] * g[i];
       sum_dg += dgi;
@@ -1068,9 +1153,13 @@ class LayerNorm {
     }
     const Acc inv_n = n > Acc{} ? Acc{1} / n : Acc{};
     const Acc a = inv_n * sum_dg, c = inv_n * sum_dg_xhat;
+    // One pass for dx and the parameter gradients.
     for (std::size_t i = 0; i < Dim; ++i) {
       const Acc m = static_cast<Acc>(mask[i]);
       const Acc xh = (x[i] - mean) * rstd;
+      const Acc md = m * d_out[i];
+      dg[i] += md * xh;
+      db[i] += md;
       dx[i] = static_cast<T>(m * rstd * (d_out[i] * g[i] - a - xh * c));
     }
   }
@@ -1145,6 +1234,8 @@ class Embedding {
   WeightTensor& weight() { return w_; }
   const WeightTensor& weight() const { return w_; }
   const WeightGradTensor& weight_grad() const { return dw_; }
+  // Writable for a trainer that sums gradients from elsewhere (replicas).
+  WeightGradTensor& weight_grad() { return dw_; }
 
  private:
   WeightTensor w_;

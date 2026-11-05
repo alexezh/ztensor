@@ -345,6 +345,17 @@ TEST(LayerNorm, MaskedWideRowsOnAPool) {
   EXPECT_EQ(dx, dx1);
   for (std::size_t i = 0; i < kDim; ++i) EXPECT_EQ(dg[i], ln.gamma_grad()(i));
 
+  // From statistics computed once: the same bits.
+  std::vector<zf::LayerNorm<float, kDim>::RowStats> stats(kRows);
+  ln.stats_rows(x.data(), mask.data(), kRows, stats.data(), &pool);
+  std::vector<float> y2(kRows * kDim), dx2(kRows * kDim);
+  ln.forward_rows_from(stats.data(), x.data(), y2.data(), kRows, mask.data(), &pool);
+  ln.zero_grad();
+  ln.backward_rows_from(stats.data(), x.data(), d.data(), dx2.data(), kRows, mask.data(), &pool);
+  EXPECT_EQ(y, y2);
+  EXPECT_EQ(dx, dx2);
+  for (std::size_t i = 0; i < kDim; ++i) EXPECT_EQ(dg[i], ln.gamma_grad()(i));
+
   for (std::size_t r = 0; r < kRows; ++r) {
     const float* xr = x.data() + r * kDim;
     const float* mr = mask.data() + r * kDim;
