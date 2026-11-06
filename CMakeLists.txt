@@ -63,6 +63,27 @@ if(ZTENSOR_NATIVE)
   endif()
 endif()
 
+# zf::apple (apple/): training graphs on the GPU, on MPSGraph. Apple only;
+# CPU-only builds are unchanged.
+if(APPLE)
+  option(ZTENSOR_APPLE_GPU "Build zf::apple, training graphs on the GPU (MPSGraph)" ON)
+else()
+  set(ZTENSOR_APPLE_GPU OFF)
+endif()
+if(ZTENSOR_APPLE_GPU)
+  enable_language(OBJCXX)
+  add_library(ztensor_apple apple/graph.mm)
+  # #include "apple/graph.h"
+  target_include_directories(ztensor_apple PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+  )
+  target_compile_options(ztensor_apple PRIVATE -fobjc-arc ${ZTENSOR_WARNINGS})
+  target_compile_definitions(ztensor_apple PUBLIC ZTENSOR_APPLE_GPU)
+  target_link_libraries(ztensor_apple PUBLIC ztensor
+    "-framework Foundation" "-framework Metal"
+    "-framework MetalPerformanceShaders" "-framework MetalPerformanceShadersGraph")
+endif()
+
 # The README example.
 add_executable(find_symbol examples/find_symbol.cpp)
 target_link_libraries(find_symbol PRIVATE ztensor)
@@ -88,6 +109,10 @@ if(ZTENSOR_BUILD_TESTS)
   )
   target_include_directories(ztensor_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   target_link_libraries(ztensor_tests PRIVATE ztensor GTest::gtest_main)
+  if(ZTENSOR_APPLE_GPU)
+    target_sources(ztensor_tests PRIVATE tests/apple_graph_test.cpp)
+    target_link_libraries(ztensor_tests PRIVATE ztensor_apple)
+  endif()
 
   include(GoogleTest)
   # Enumerate at ctest time: a slow first launch of a large, template-heavy
