@@ -106,6 +106,7 @@ if(ZTENSOR_BUILD_TESTS)
     tests/bf16_test.cpp
     tests/thread_pool_test.cpp
     tests/replicas_test.cpp
+    tests/lowrescross_test.cpp
   )
   target_include_directories(ztensor_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   target_link_libraries(ztensor_tests PRIVATE ztensor GTest::gtest_main)
