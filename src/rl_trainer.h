@@ -3,7 +3,7 @@
 // Reinforcement learning by policy gradient: rounds of many episodes run
 // side by side, then one update over everything they did.
 //
-// RLTrainer<Policy, Envs>::round():
+// RLTrainer<Model, Envs>::round():
 //
 //   rollout  M episodes step in lockstep: each tick, one batched act() over
 //            every episode still going (a GPU-sized batch), then each one's
@@ -19,13 +19,18 @@
 //            optimizer step: the policy's loss is -A log pi(action | seen),
 //            plus whatever it predicts and can be taught by what happened
 //
-// The policy (the model) samples and learns; the trainer knows neither its
-// heads nor its losses:
+// The policy samples and learns; the trainer knows neither its heads nor
+// its losses. It reaches the model through RLPolicy<Model>:
 //
 //   using Obs, Action;
 //   void act(const std::vector<const Obs*>& seen, std::mt19937_64* rng,
 //            std::vector<Action>* out);         // sampled, one per seen
 //   void reinforce(const std::vector<RLSample<Obs, Action>>& batch, float lr);
+//
+// By default RLPolicy forwards to the model's own members of those names. A
+// model whose reinforcement learning is more than that (its own clip, its
+// own GPU step) keeps it out of its class: it specializes RLPolicy<Model>,
+// an object over the model that may keep state of its own (its stats).
 //
 // The environments, vectorized -- one object for the round's M episodes, so
 // observing can batch whatever else runs per tick (another model):
@@ -60,9 +65,26 @@ struct RLSample {
   float advantage = 0.0f;
 };
 
-template <typename Policy, typename Envs>
+// The model as RLTrainer drives it: its own members.
+template <typename Model>
+struct RLPolicy {
+  using Obs = typename Model::Obs;
+  using Action = typename Model::Action;
+
+  explicit RLPolicy(Model& model) : model_(model) {}
+  void act(const std::vector<const Obs*>& seen, std::mt19937_64* rng, std::vector<Action>* out) {
+    model_.act(seen, rng, out);
+  }
+  void reinforce(const std::vector<RLSample<Obs, Action>>& batch, float lr) { model_.reinforce(batch, lr); }
+
+ private:
+  Model& model_;
+};
+
+template <typename Model, typename Envs>
 class RLTrainer {
  public:
+  using Policy = RLPolicy<Model>;
   using Obs = typename Policy::Obs;
   using Action = typename Policy::Action;
   using Sample = RLSample<Obs, Action>;
@@ -82,7 +104,9 @@ class RLTrainer {
     double mean_return() const { return episodes == 0 ? 0.0 : reward / static_cast<double>(episodes); }
   };
 
-  RLTrainer(Policy& policy, Envs& envs, Options options) : policy_(policy), envs_(envs), o_(options) {}
+  RLTrainer(Model& model, Envs& envs, Options options) : policy_(model), envs_(envs), o_(options) {}
+
+  Policy& policy() { return policy_; }
 
   Round round(float lr, std::uint64_t seed) {
     Round r;
@@ -208,7 +232,7 @@ class RLTrainer {
     }
   }
 
-  Policy& policy_;
+  Policy policy_;
   Envs& envs_;
   Options o_;
   std::vector<Episode> episodes_;

@@ -38,6 +38,43 @@ struct TablePolicy {
   }
 };
 
+// The same table with no RL of its own: what it keeps, and the step it
+// takes. RLPolicy<Table> adds the sampling, the gradient and its own count.
+struct Table {
+  std::array<std::array<double, 2>, 2> logits{};
+  double p(int s, int a) const {
+    const double e0 = std::exp(logits[s][0]), e1 = std::exp(logits[s][1]);
+    return (a == 0 ? e0 : e1) / (e0 + e1);
+  }
+};
+
+}  // namespace
+
+template <>
+struct zf::RLPolicy<Table> {
+  using Obs = int;
+  using Action = int;
+  explicit RLPolicy(Table& t) : table(t) {}
+  void act(const std::vector<const Obs*>& seen, std::mt19937_64* rng, std::vector<Action>* out) {
+    for (const Obs* s : seen) out->push_back(std::bernoulli_distribution(table.p(*s, 1))(*rng) ? 1 : 0);
+  }
+  void reinforce(const std::vector<RLSample<Obs, Action>>& batch, float lr) {
+    std::array<std::array<double, 2>, 2> g{};
+    for (const auto& x : batch) {
+      const int s = *x.seen;
+      for (int a = 0; a < 2; ++a) g[s][a] += x.advantage * (table.p(s, a) - (a == *x.action ? 1.0 : 0.0));
+    }
+    for (int s = 0; s < 2; ++s) {
+      for (int a = 0; a < 2; ++a) table.logits[s][a] -= lr * g[s][a] / static_cast<double>(batch.size());
+    }
+    ++updates;
+  }
+  Table& table;
+  std::size_t updates = 0;
+};
+
+namespace {
+
 // Episodes of up to 6 ticks; the state flips each tick from a random start,
 // and an episode ends early, at random, a third of the time.
 struct FlipEnvs {
@@ -87,6 +124,23 @@ TEST(RLTrainer, LearnsWhichActionPays) {
   EXPECT_GT(policy.p(0, 0), 0.9);
   EXPECT_GT(policy.p(1, 1), 0.9);
   EXPECT_GT(last, first.mean_return() + 1.0);
+}
+
+// A model with no RL members, through its RLPolicy specialization: the
+// same rounds as the model that has them.
+TEST(RLTrainer, ASpecializedPolicyDrivesAModelWithoutRlMembers) {
+  TablePolicy own;
+  Table table;
+  FlipEnvs e1, e2;
+  zf::RLTrainer<TablePolicy, FlipEnvs> t1(own, e1, {});
+  zf::RLTrainer<Table, FlipEnvs> t2(table, e2, {});
+  for (int k = 1; k <= 3; ++k) {
+    t1.round(0.5f, k);
+    t2.round(0.5f, k);
+  }
+  EXPECT_EQ(table.logits, own.logits);
+  EXPECT_EQ(t2.policy().updates, own.updates);
+  EXPECT_GT(t2.policy().updates, 0u);
 }
 
 // The same seed, the same round.

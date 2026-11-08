@@ -6,17 +6,21 @@
 //
 // The CPU model stays the master copy: the runs read a copy of the facade's
 // weights, taken again only when their version has moved (once a step),
-// and the gradients come back into the facade's, so the heads, the losses
-// and the step stay on the CPU, the same for both implementations. The
-// gradients add up on the GPU over a sequence of runs (each run adds its
-// own into a running sum) and come back once at its end: after a batch's
-// backward, or at backward_memories(). A backward run recomputes its
-// forward on the GPU: a run keeps no activations.
+// and the gradients come back into the facade's, so the step stays on the
+// CPU, the same for both implementations. The gradients add up on the GPU
+// over a sequence of runs (each run adds its own into a running sum) and
+// come back once at its end: after a batch's backward, or at
+// backward_memories(). A backward run recomputes its forward on the GPU: a
+// run keeps no activations.
 //
-// Three graphs, each made for a capacity on first use (passes and cache
+// Four graphs, each made for a capacity on first use (passes and cache
 // rows round up to powers of two; the rest is padding):
 //
 //   batch   forward_batch: each pass's memory side and the stack, in one
+//   step    step_batch: the batch graph with the model's heads and loss on
+//           top -- forward, loss and every gradient in one run, where
+//           forward_batch, the heads on the CPU and backward_batch take
+//           two runs and a wait between them (one per kind of heads)
 //   memory  the memories' cache: rows in, every layer's cross K and V out
 //   pass    forward_shared: the stack over K and V gathered from the cache
 //
@@ -37,6 +41,8 @@
 #include <memory>
 #include <stdexcept>
 #include <type_traits>
+#include <typeindex>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
@@ -75,29 +81,37 @@ class LowResCrossApple {
     mode_ = Mode::kBatch;
     BatchGraph& bg = batch_graph(w, batch.size());
     upload(w);
-    bg.in.zero();
-    Builder::clear_queries(bg.in, bg.q);
-    Builder::clear_ids(bg.in, bg.m);
-    float* cbias = bg.in[bg.cbias].data();
-    std::fill(cbias, cbias + bg.batch * kM, Builder::kNoKey);
-    begin_batch(batch.size());
-    for (std::size_t b = 0; b < batch.size(); ++b) {
-      const std::vector<Input>& ms = *batch[b].memory;
-      if (ms.size() > M) throw std::length_error("LowResCross overflow");
-      Builder::put_queries(bg.in, bg.q, static_cast<int>(b), *batch[b].queries, !ms.empty());
-      for (std::size_t j = 0; j < ms.size(); ++j) {
-        const int row = static_cast<int>(b) * kM + static_cast<int>(j);
-        Builder::put_row(bg.in, bg.m, row, ms[j]);
-        cbias[row] = 0.0f;
-      }
-      add_pass(*batch[b].queries, b * M, ms.size());
-    }
-    std::vector<Bind> in, out{{bg.hidden, bg.hidden_out}, {bg.m.rows, bg.rows_out}};
-    bind_inputs(bg.g, bg.in, &in);
+    pack(bg.blk, batch);
+    std::vector<Bind> in, out{{bg.hidden, bg.hidden_out}, {bg.blk.m.rows, bg.rows_out}};
+    bind_inputs(bg.g, bg.blk.in, &in);
     bg.g.g.run(in, out);
     hidden_ = bg.hidden_out;
     rows_ = bg.rows_out;
-    d_rows_ = bg.in[bg.d_rows];
+    d_rows_ = bg.blk.in[bg.d_rows];
+  }
+
+  // A whole step's gradients in one run: the stack, `heads` on its readouts
+  // and memory rows, their loss, and the gradients of every weight -- the
+  // stack's into the facade's, the heads' into theirs. Nothing of the batch
+  // is left to read but what the heads read back (no readouts, no
+  // backward_batch()).
+  template <typename HeadSet>
+  void step_batch(Weights& w, const std::vector<Pass>& batch, HeadSet& heads) {
+    mode_ = Mode::kStep;
+    StepGraph<HeadSet>& sg = step_graph(w, batch.size(), heads);
+    upload(w);
+    sg.heads.upload(heads);  // small: every run
+    pack(sg.blk, batch);
+    heads.fill(sg.nodes, sg.blk.in);
+    std::vector<Bind> in, out;
+    bind_inputs(sg.g, sg.blk.in, &in);
+    sg.heads.bind(&in);
+    sg.out.bind(&out);
+    for (std::size_t i = 0; i < sg.head_grads.size(); ++i) out.push_back({sg.head_grads[i], sg.head_grad_bufs[i]});
+    run_with_grads(sg.g, &in, &out);
+    flush_grads(w);
+    zf::apple::add_grads(sg.head_grad_bufs, heads);
+    heads.read(sg.nodes, sg.out);
   }
 
   // --- the memories' cache ---
@@ -194,19 +208,20 @@ class LowResCrossApple {
   T* memory_grad(std::size_t b) { return d_rows_.data() + mb_[b] * kStream; }
 
   std::vector<std::vector<StateGrad>> backward_batch(Weights& w, const std::vector<zf::Tensor<T, Q, kHidden>>& d_readout) {
+    if (mode_ == Mode::kStep) throw std::logic_error("LowResCross: no backward_batch() after step_batch()");
     if (d_readout.size() != batch_size()) throw std::invalid_argument("LowResCross: one gradient per pass");
     std::vector<Bind> in, out;
     Buffer d_hidden, dx;
     if (mode_ == Mode::kBatch) {
       BatchGraph& bg = *batch_graphs_[cap_b_];
-      bind_inputs(bg.g, bg.in, &in);
-      d_hidden = bg.in[bg.d_hidden];
+      bind_inputs(bg.g, bg.blk.in, &in);
+      d_hidden = bg.blk.in[bg.d_hidden];
       dx = bg.dx_out;
       out.push_back({bg.dx, dx});
       fill_d_hidden(d_readout, &d_hidden);
       run_with_grads(bg.g, &in, &out);
       flush_grads(w);
-      bg.in[bg.d_rows].zero();
+      bg.blk.in[bg.d_rows].zero();
     } else {
       PassGraph& pg = *pass_graphs_[{cap_b_, cache_.cap}];
       bind_inputs(pg.g, pg.in, &in);
@@ -232,7 +247,7 @@ class LowResCrossApple {
   }
 
  private:
-  enum class Mode { kBatch, kShared };
+  enum class Mode { kBatch, kShared, kStep };
 
   // A graph with the weights as its inputs and their gradients: alone, and
   // added to a running sum (sum_in + grad).
@@ -241,14 +256,34 @@ class LowResCrossApple {
     zf::apple::Params params;
     std::vector<Node> grads, sum_in, sum_out;
   };
-  struct BatchGraph {
+  // Passes as the batch and step graphs take them: each pass's query rows,
+  // its memory rows, and which of those are keys.
+  struct Block {
     int batch = 0;
-    Weighted g;
     LowResGraphInputs in;
     typename Builder::Queries q;
     typename Builder::Rows m;
-    Node cbias, d_hidden, d_rows, hidden, dx;
+    Node cbias;
+  };
+  struct BatchGraph {
+    Weighted g;
+    Block blk;
+    Node d_hidden, d_rows, hidden, dx;
     Buffer hidden_out, rows_out, dx_out;
+  };
+  // One per kind of heads and capacity.
+  struct AnyStep {
+    virtual ~AnyStep() = default;
+  };
+  template <typename HeadSet>
+  struct StepGraph : AnyStep {
+    Weighted g;
+    Block blk;
+    zf::apple::Params heads;
+    std::vector<Node> head_grads;
+    std::vector<Buffer> head_grad_bufs;
+    LowResGraphOutputs out;
+    typename HeadSet::Nodes nodes;
   };
   struct MemoryGraph {
     int cap = 0;
@@ -364,29 +399,57 @@ class LowResCrossApple {
   }
   static Node dot_sum(zf::apple::Graph& g, Node a, Node b) { return g.sum_all(g.mul(a, b)); }
 
+  void make_block(Builder& net, zf::apple::Graph& g, int batch, Block* b) {
+    b->batch = batch;
+    b->q = net.queries(b->in, batch, kQ);
+    b->m = net.rows(b->in, batch * kM);
+    b->cbias = b->in.add(g, {batch, 1, 1, kM});
+  }
+  // The stack over a block's passes: its final hidden state, [batch * Q, kHidden].
+  static Node block_hidden(Builder& net, const Block& b) {
+    return net.hidden(net.stack(b.q, net.memory_side(b.m.rows, b.m.mask), b.cbias, kM));
+  }
+
   BatchGraph& batch_graph(Weights& w, std::size_t n) {
     cap_b_ = capacity(n, 8);
     auto& slot = batch_graphs_[cap_b_];
     if (slot != nullptr) return *slot;
     slot = std::make_unique<BatchGraph>();
     BatchGraph& bg = *slot;
-    bg.batch = cap_b_;
     make_weighted(w, &bg.g);
     zf::apple::Graph& g = bg.g.g;
     Builder net(g, bg.g.params, w.layers.size());
-    bg.q = net.queries(bg.in, bg.batch, kQ);
-    bg.m = net.rows(bg.in, bg.batch * kM);
-    bg.cbias = bg.in.add(g, {bg.batch, 1, 1, kM});
-    bg.d_hidden = bg.in.add(g, {bg.batch * kQ, kH});
-    bg.d_rows = bg.in.add(g, {bg.batch * kM, kS});
-    const std::vector<typename Builder::KV> kv = net.memory_side(bg.m.rows, bg.m.mask);
-    bg.hidden = net.hidden(net.stack(bg.q, kv, bg.cbias, kM));
-    const Node loss = g.add(dot_sum(g, bg.hidden, bg.d_hidden), dot_sum(g, bg.m.rows, bg.d_rows));
-    bg.dx = weigh(bg.g, loss, {bg.q.rows.x})[0];
+    make_block(net, g, cap_b_, &bg.blk);
+    bg.d_hidden = bg.blk.in.add(g, {cap_b_ * kQ, kH});
+    bg.d_rows = bg.blk.in.add(g, {cap_b_ * kM, kS});
+    bg.hidden = block_hidden(net, bg.blk);
+    const Node loss = g.add(dot_sum(g, bg.hidden, bg.d_hidden), dot_sum(g, bg.blk.m.rows, bg.d_rows));
+    bg.dx = weigh(bg.g, loss, {bg.blk.q.rows.x})[0];
     bg.hidden_out = Buffer(g.elements(bg.hidden));
-    bg.rows_out = Buffer(g.elements(bg.m.rows));
+    bg.rows_out = Buffer(g.elements(bg.blk.m.rows));
     bg.dx_out = Buffer(g.elements(bg.dx));
     return bg;
+  }
+
+  template <typename HeadSet>
+  StepGraph<HeadSet>& step_graph(Weights& w, std::size_t n, HeadSet& heads) {
+    cap_b_ = capacity(n, 8);
+    auto& slot = step_graphs_[{std::type_index(typeid(HeadSet)), cap_b_}];
+    if (slot != nullptr) return static_cast<StepGraph<HeadSet>&>(*slot);
+    auto made = std::make_unique<StepGraph<HeadSet>>();
+    StepGraph<HeadSet>& sg = *made;
+    make_weighted(w, &sg.g);
+    zf::apple::Graph& g = sg.g.g;
+    Builder net(g, sg.g.params, w.layers.size());
+    make_block(net, g, cap_b_, &sg.blk);
+    sg.heads.declare(g, heads);
+    LowResHeadsGraph hg{g, sg.heads, sg.blk.in, sg.out, cap_b_, kQ, kM, block_hidden(net, sg.blk), sg.blk.m.rows};
+    const Node loss = heads.build(hg, &sg.nodes);
+    if (!sg.heads.all_taken()) throw std::logic_error("LowResCross: heads' parameters left over");
+    sg.head_grads = weigh(sg.g, loss, sg.heads.nodes());
+    for (const Node d : sg.head_grads) sg.head_grad_bufs.emplace_back(g.elements(d));
+    slot = std::move(made);
+    return sg;
   }
 
   MemoryGraph& memory_graph(Weights& w) {
@@ -542,6 +605,28 @@ class LowResCrossApple {
     summing_ = false;
   }
 
+  // `batch` into a block's inputs (every input zeroed first), and the
+  // batch's bookkeeping.
+  void pack(Block& blk, const std::vector<Pass>& batch) {
+    blk.in.zero();
+    Builder::clear_queries(blk.in, blk.q);
+    Builder::clear_ids(blk.in, blk.m);
+    float* cbias = blk.in[blk.cbias].data();
+    std::fill(cbias, cbias + blk.batch * kM, Builder::kNoKey);
+    begin_batch(batch.size());
+    for (std::size_t b = 0; b < batch.size(); ++b) {
+      const std::vector<Input>& ms = *batch[b].memory;
+      if (ms.size() > M) throw std::length_error("LowResCross overflow");
+      Builder::put_queries(blk.in, blk.q, static_cast<int>(b), *batch[b].queries, !ms.empty());
+      for (std::size_t j = 0; j < ms.size(); ++j) {
+        const int row = static_cast<int>(b) * kM + static_cast<int>(j);
+        Builder::put_row(blk.in, blk.m, row, ms[j]);
+        cbias[row] = 0.0f;
+      }
+      add_pass(*batch[b].queries, b * M, ms.size());
+    }
+  }
+
   void begin_batch(std::size_t n) {
     qo_.assign(1, 0);
     mb_.clear();
@@ -570,6 +655,7 @@ class LowResCrossApple {
   std::map<int, std::unique_ptr<BatchGraph>> batch_graphs_;
   std::map<int, std::unique_ptr<MemoryGraph>> memory_graphs_;
   std::map<std::pair<int, int>, std::unique_ptr<PassGraph>> pass_graphs_;
+  std::map<std::pair<std::type_index, int>, std::unique_ptr<AnyStep>> step_graphs_;
   // The weights as of version uploaded_; the gradients' running sum
   // (summing_: a run has written it since the last flush).
   std::vector<Buffer> weights_, sums_, sums_next_;

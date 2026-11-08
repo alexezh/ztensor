@@ -50,6 +50,35 @@ class LowResGraphInputs {
   std::vector<zf::apple::Graph::Bind> binds_;
 };
 
+// Graph results read back, each with the buffer it lands in.
+class LowResGraphOutputs {
+ public:
+  void add(zf::apple::Graph& g, zf::apple::Node n) { binds_.push_back({n, zf::apple::Buffer(g.elements(n))}); }
+  const zf::apple::Buffer& operator[](zf::apple::Node n) const {
+    for (const auto& b : binds_) {
+      if (b.node.id == n.id) return b.buffer;
+    }
+    throw std::logic_error("LowResGraphOutputs: no such output");
+  }
+  void bind(std::vector<zf::apple::Graph::Bind>* into) const { into->insert(into->end(), binds_.begin(), binds_.end()); }
+
+ private:
+  std::vector<zf::apple::Graph::Bind> binds_;
+};
+
+// What a model's heads build on in a whole step (LowResCross::step_batch):
+// the stack's results, and where the heads declare their parameters, the
+// inputs each run feeds and the results each run reads back.
+struct LowResHeadsGraph {
+  zf::apple::Graph& g;
+  zf::apple::Params& params;  // the heads' parameters: params.next(), in visit_params order
+  LowResGraphInputs& in;      // fed by the heads before each run
+  LowResGraphOutputs& out;    // read by the heads after each run
+  int batch = 0, q = 0, m = 0;  // passes, and query and memory rows per pass
+  zf::apple::Node hidden;     // the readouts, [batch * q, kHidden]
+  zf::apple::Node rows;       // the memory rows as the stack reads them, [batch * m, kStream]
+};
+
 template <typename T, typename Layout, std::size_t Heads, std::size_t HD>
 class LowResCrossGraph {
  public:

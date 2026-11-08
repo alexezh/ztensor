@@ -230,6 +230,48 @@ class LowResCross {
     return std::move(backward_batch(d)[0]);
   }
 
+  // --- a whole step on the GPU ---
+  //
+  // step_batch() runs forward, the model's heads and their loss, and every
+  // gradient in one GPU run: no readouts come back, no backward_batch(). The
+  // heads are the model's, built from graph ops (apple/lowrescross_graph.h):
+  //
+  //   template <typename Visit> void visit_layers(Visit&&);  // the heads' layers
+  //   struct Nodes;  // what build() keeps of the graph
+  //   apple::Node build(LowResHeadsGraph&, Nodes*);
+  //        // the heads on hg.hidden and hg.rows, taking their parameters
+  //        // with hg.params.next(), their inputs with hg.in.add() and their
+  //        // results with hg.out.add(); returns the loss, summed over passes
+  //   void fill(const Nodes&, LowResGraphInputs&);
+  //        // this batch's inputs, over zeros (a padded pass stays zero and
+  //        // must add nothing)
+  //   void read(const Nodes&, const LowResGraphOutputs&);  // after the run
+  //
+  // The stack's gradients add into its weights', the heads' into theirs.
+  // On the CPU, a model does the same with forward_batch(), its heads and
+  // backward_batch().
+
+  // Whether step_batch() takes a batch of n passes: where forward_batch()
+  // would run it, the GPU.
+  bool steps_on_gpu(std::size_t n) const {
+    return kGpu && (device_ != Device::kAuto ? device_ == Device::kApple : lowres_device_for(n) == Device::kApple);
+  }
+  template <typename HeadSet>
+  void step_batch(const std::vector<Pass>& batch, HeadSet& heads) {
+#if defined(ZTENSOR_APPLE_GPU)
+    if constexpr (kGpu) {
+      if (steps_on_gpu(batch.size())) {
+        on_ = Device::kApple;
+        gpu_.get().step_batch(w_, batch, heads);
+        return;
+      }
+    }
+#endif
+    (void)batch;
+    (void)heads;
+    throw std::logic_error("LowResCross: step_batch() runs on the GPU only");
+  }
+
   // The layers, to read or change: the weights count as changed (an
   // optimizer, a load, a copy into a replica), so the implementation takes
   // them afresh before its next run. A pointer kept from one visit must not
