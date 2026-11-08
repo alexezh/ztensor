@@ -25,6 +25,32 @@ then one update covers everything they did.
 A round is on-policy: one set of weights acts, then learns from what it did.
 Rounds are deterministic for a seed.
 
+## Overlap
+
+With `Options::overlap` (on by default), the rollout keeps the CPU and the GPU
+busy at once:
+- The episodes split into two halves on a group boundary, and each half
+  steps through its own ticks.
+- While the policy acts for one half on a pool worker, the caller steps and
+  observes the other half's environments. A GPU run blocks that worker until
+  it's done.
+- Then the caller waits for the act, and the halves trade places.
+
+Rules and costs:
+- The policy is never called from two threads at once. Only the other half's
+  environments run beside it, so `step()` and `observe()` must not share state
+  with the policy.
+- Each half acts on half the batch, so overlap pays when the act's cost grows
+  with its batch. A fixed cost per call is paid twice as often.
+- Overlapped rounds repeat for a seed, but they don't match rounds without
+  overlap.
+
+`Round` splits the time:
+- `seconds_act`: the policy's act calls, on whichever thread;
+- `seconds_env`: `observe()` and `step()` on the caller;
+- `seconds_wait`: the caller waiting for an act;
+- `seconds_credit`: returns and advantages, within `seconds_update`.
+
 ```cpp
 zf::RLTrainer<MyModel, MyEnvs>::Options o;
 o.episodes = 256;  // M

@@ -1,4 +1,8 @@
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstddef>
 #include <random>
@@ -143,16 +147,87 @@ TEST(RLTrainer, ASpecializedPolicyDrivesAModelWithoutRlMembers) {
   EXPECT_GT(t2.policy().updates, 0u);
 }
 
+// Without overlap: one batch a tick, everything on the caller.
+TEST(RLTrainer, LearnsWithoutOverlap) {
+  TablePolicy policy;
+  FlipEnvs envs;
+  zf::RLTrainer<TablePolicy, FlipEnvs>::Options o;
+  o.episodes = 64;
+  o.group = 4;
+  o.ticks = 10;
+  o.batch = 32;
+  o.overlap = false;
+  zf::RLTrainer<TablePolicy, FlipEnvs> trainer(policy, envs, o);
+  for (int k = 1; k <= 40; ++k) {
+    const auto r = trainer.round(0.5f, k);
+    EXPECT_EQ(r.seconds_wait, 0.0);
+  }
+  EXPECT_GT(policy.p(0, 0), 0.9);
+  EXPECT_GT(policy.p(1, 1), 0.9);
+}
+
+// A slow act (a GPU run) and slow environments: the caller steps one half
+// while the other half's act runs on a worker, never two acts at once, and
+// the round takes less than the two one after the other.
+struct SlowPolicy : TablePolicy {
+  std::atomic<int> in_act{0};
+  int most = 0;
+  std::size_t acts = 0;
+  void act(const std::vector<const Obs*>& seen, std::mt19937_64* rng, std::vector<Action>* out) {
+    most = std::max(most, ++in_act);
+    std::this_thread::sleep_for(std::chrono::milliseconds(4));
+    TablePolicy::act(seen, rng, out);
+    ++acts;
+    --in_act;
+  }
+};
+struct SlowEnvs : FlipEnvs {
+  void observe(const std::vector<std::size_t>& live, std::vector<int>* out) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(4));
+    FlipEnvs::observe(live, out);
+  }
+};
+
+TEST(RLTrainer, ActsForOneHalfWhileTheOtherSteps) {
+  if (zf::ThreadPool::global().participants() < 2) GTEST_SKIP() << "no pool workers";
+  const auto run = [](bool overlap, SlowPolicy* policy) {
+    SlowEnvs envs;
+    zf::RLTrainer<SlowPolicy, SlowEnvs>::Options o;
+    o.episodes = 32;
+    o.group = 4;
+    o.ticks = 6;
+    o.overlap = overlap;
+    zf::RLTrainer<SlowPolicy, SlowEnvs> trainer(*policy, envs, o);
+    return trainer.round(0.5f, 3);
+  };
+  SlowPolicy seq, ovl;
+  const auto rs = run(false, &seq);
+  const auto ro = run(true, &ovl);
+  EXPECT_EQ(ovl.most, 1);
+  EXPECT_EQ(ovl.acts, 2 * seq.acts);  // each half acts on its own
+  EXPECT_EQ(ro.steps, rs.steps);
+  // Sequential: every observe and act in turn. Overlapped: about half of it
+  // hidden, though each half observes and acts as often as the whole did.
+  EXPECT_LT(ro.seconds_rollout, 0.8 * (rs.seconds_rollout * 2)) << rs.seconds_rollout << " " << ro.seconds_rollout;
+  EXPECT_GT(ro.seconds_act, 0.0);
+  EXPECT_GT(ro.seconds_env, 0.0);
+  EXPECT_LT(ro.seconds_wait, ro.seconds_act);
+}
+
 // The same seed, the same round.
 TEST(RLTrainer, RoundsRepeatForASeed) {
-  const auto run = [] {
-    TablePolicy policy;
-    FlipEnvs envs;
-    zf::RLTrainer<TablePolicy, FlipEnvs> trainer(policy, envs, {});
-    trainer.round(0.5f, 7);
-    return policy.logits;
-  };
-  EXPECT_EQ(run(), run());
+  for (bool overlap : {false, true}) {
+    const auto run = [&] {
+      TablePolicy policy;
+      FlipEnvs envs;
+      zf::RLTrainer<TablePolicy, FlipEnvs>::Options o;
+      o.overlap = overlap;
+      zf::RLTrainer<TablePolicy, FlipEnvs> trainer(policy, envs, o);
+      trainer.round(0.5f, 7);
+      return policy.logits;
+    };
+    EXPECT_EQ(run(), run()) << overlap;
+  }
 }
 
 }  // namespace

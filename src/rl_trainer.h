@@ -46,6 +46,19 @@
 //
 // The round is on-policy: one set of weights acts, then learns from what it
 // did. Rounds are deterministic for a seed.
+//
+// Overlap (Options::overlap, on by default): the rollout keeps the CPU and
+// the GPU busy at once. The episodes split into two halves on a group
+// boundary, each stepping through its own ticks. While the policy acts for
+// one half on a pool worker -- a GPU run blocks that worker until it is
+// done -- the caller steps and observes the other half's environments, then
+// waits for the act (zf::Completion) and the halves trade places. The
+// policy is never called from two threads at once; only the environments of
+// the other half run beside it, so step() and observe() must not share
+// state with the policy, nor between the halves' episodes (observe() of one
+// half may run while the policy acts for the other). Each half acts on half
+// the batch. The order of everything is fixed, so overlapped rounds repeat
+// for a seed too, though not the same as rounds without overlap.
 
 #include <algorithm>
 #include <chrono>
@@ -53,8 +66,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <numeric>
+#include <exception>
 #include <random>
 #include <vector>
+
+#include "thread_pool.h"
 
 namespace zf {
 
@@ -95,12 +111,18 @@ class RLTrainer {
     std::size_t ticks = 30;      // the longest episode
     double gamma = 0.85;         // discount per tick
     std::size_t batch = 256;     // steps per update
+    bool overlap = true;         // act for one half while the other steps
   };
 
   struct Round {
     std::size_t episodes = 0, steps = 0, updates = 0;
     double reward = 0.0;  // summed over every step
     double seconds_rollout = 0.0, seconds_update = 0.0;
+    // Within the rollout: the policy's act() (on whichever thread), the
+    // environments' observe() and step() on the caller, and the caller
+    // waiting for an act(). Within the update: the credit, then reinforce().
+    double seconds_act = 0.0, seconds_env = 0.0, seconds_wait = 0.0;
+    double seconds_credit = 0.0;
     double mean_return() const { return episodes == 0 ? 0.0 : reward / static_cast<double>(episodes); }
   };
 
@@ -112,53 +134,154 @@ class RLTrainer {
     Round r;
     r.episodes = o_.episodes;
     std::mt19937_64 rng(seed);
-    const auto t0 = std::chrono::steady_clock::now();
+    const auto t0 = Clock::now();
     rollout(&rng, &r);
-    const auto t1 = std::chrono::steady_clock::now();
+    const auto t1 = Clock::now();
     const std::vector<Sample> samples = credit();
+    const auto t2 = Clock::now();
     update(samples, lr, &rng, &r);
     r.steps = samples.size();
-    r.seconds_rollout = std::chrono::duration<double>(t1 - t0).count();
-    r.seconds_update = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+    r.seconds_rollout = seconds(t0, t1);
+    r.seconds_credit = seconds(t1, t2);
+    r.seconds_update = seconds(t1, Clock::now());
     return r;
   }
 
  private:
+  using Clock = std::chrono::steady_clock;
+  static double seconds(Clock::time_point a, Clock::time_point b) {
+    return std::chrono::duration<double>(b - a).count();
+  }
+
   struct Episode {
     std::vector<Obs> seen;
     std::vector<Action> actions;
     std::vector<float> rewards;
   };
 
-  void rollout(std::mt19937_64* rng, Round* r) {
-    const std::size_t m = o_.episodes;
-    envs_.reset(m, std::max<std::size_t>(1, o_.group), (*rng)());
-    episodes_.assign(m, {});
+  // Episodes [b0, b1), stepping through their ticks together: observed
+  // (seen, for the live), then acted, then stepped.
+  struct Half {
+    enum class Next { kObserve, kAct, kStep, kDone };
+    std::size_t b0 = 0, b1 = 0, tick = 0;
+    Next next = Next::kObserve;
     std::vector<std::size_t> live;
     std::vector<Obs> seen;
     std::vector<const Obs*> ptrs;
     std::vector<Action> actions;
-    for (std::size_t t = 0; t < o_.ticks; ++t) {
-      live.clear();
-      for (std::size_t i = 0; i < m; ++i) {
-        if (!envs_.done(i)) live.push_back(i);
+  };
+
+  void rollout(std::mt19937_64* rng, Round* r) {
+    const std::size_t m = o_.episodes;
+    const std::size_t group = std::max<std::size_t>(1, o_.group);
+    envs_.reset(m, group, (*rng)());
+    episodes_.assign(m, {});
+    // Two halves on a group boundary, so a group's episodes act together.
+    const std::size_t groups = (m + group - 1) / group;
+    const std::size_t split = o_.overlap && groups >= 2 ? std::min(m, (groups + 1) / 2 * group) : m;
+    std::vector<Half> halves(split < m ? 2 : 1);
+    halves[0].b1 = split;
+    if (halves.size() == 2) {
+      halves[1].b0 = split;
+      halves[1].b1 = m;
+    }
+    if (halves.size() == 1) {
+      Half& h = halves[0];
+      for (;;) {
+        cpu_work(h, r);
+        if (h.next == Half::Next::kDone) break;
+        const auto t = Clock::now();
+        act(h, rng);
+        r->seconds_act += seconds(t, Clock::now());
       }
-      if (live.empty()) break;
-      seen.clear();
-      envs_.observe(live, &seen);
-      ptrs.clear();
-      for (const Obs& s : seen) ptrs.push_back(&s);
-      actions.clear();
-      policy_.act(ptrs, rng, &actions);
-      for (std::size_t k = 0; k < live.size(); ++k) {
-        Episode& ep = episodes_[live[k]];
-        ep.seen.push_back(std::move(seen[k]));
-        ep.actions.push_back(std::move(actions[k]));
-        const float reward = envs_.step(live[k], ep.actions.back(), &ep.seen.back());
+      return;
+    }
+    // One half acts on a worker while the caller moves the other on.
+    for (std::size_t cur = 0;; cur = 1 - cur) {
+      Half& a = halves[cur];
+      Half& b = halves[1 - cur];
+      if (a.next == Half::Next::kDone && b.next == Half::Next::kDone) break;
+      if (a.next != Half::Next::kAct) {
+        cpu_work(b, r);
+        continue;
+      }
+      beside([&] { act(a, rng); }, [&] { cpu_work(b, r); }, r);
+    }
+  }
+
+  // The caller's part for a half: step what it acted on, then observe
+  // what comes next (or find it done).
+  void cpu_work(Half& h, Round* r) {
+    const auto t = Clock::now();
+    if (h.next == Half::Next::kStep) {
+      for (std::size_t k = 0; k < h.live.size(); ++k) {
+        Episode& ep = episodes_[h.live[k]];
+        ep.seen.push_back(std::move(h.seen[k]));
+        ep.actions.push_back(std::move(h.actions[k]));
+        const float reward = envs_.step(h.live[k], ep.actions.back(), &ep.seen.back());
         ep.rewards.push_back(reward);
         r->reward += reward;
       }
+      ++h.tick;
+      h.next = Half::Next::kObserve;
     }
+    if (h.next == Half::Next::kObserve) {
+      h.live.clear();
+      if (h.tick < o_.ticks) {
+        for (std::size_t i = h.b0; i < h.b1; ++i) {
+          if (!envs_.done(i)) h.live.push_back(i);
+        }
+      }
+      if (h.live.empty()) {
+        h.next = Half::Next::kDone;
+      } else {
+        h.seen.clear();
+        envs_.observe(h.live, &h.seen);
+        h.ptrs.clear();
+        for (const Obs& o : h.seen) h.ptrs.push_back(&o);
+        h.next = Half::Next::kAct;
+      }
+    }
+    r->seconds_env += seconds(t, Clock::now());
+  }
+
+  void act(Half& h, std::mt19937_64* rng) {
+    h.actions.clear();
+    policy_.act(h.ptrs, rng, &h.actions);
+    h.next = Half::Next::kStep;
+  }
+
+  // on_worker() on a pool worker while the caller runs here(); then the
+  // caller waits for it. The act's time is its own, the wait the caller's.
+  template <typename OnWorker, typename Here>
+  void beside(OnWorker&& on_worker, Here&& here, Round* r) {
+    struct Task {
+      OnWorker* f;
+      double took = 0.0;
+      std::exception_ptr error;
+      static void run(void* ctx, std::size_t) {
+        Task& t = *static_cast<Task*>(ctx);
+        const auto t0 = Clock::now();
+        try {
+          (*t.f)();
+        } catch (...) {
+          t.error = std::current_exception();
+        }
+        t.took = RLTrainer::seconds(t0, Clock::now());
+      }
+    };
+    Task task{&on_worker};
+    Completion done;
+    done.add(1);
+    const WorkItem item{&Task::run, &task, 0, &done};
+    ThreadPool& pool = ThreadPool::global();
+    pool.submit(&item, 1);
+    here();
+    const auto t = Clock::now();
+    pool.wait(done);
+    r->seconds_wait += seconds(t, Clock::now());
+    r->seconds_act += task.took;
+    if (task.error) std::rethrow_exception(task.error);
   }
 
   // Every step with its advantage.
