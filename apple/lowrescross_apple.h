@@ -4,11 +4,14 @@
 // zf::apple graphs (lowrescross_graph.h has the pieces). Built only with
 // ztensor's GPU target (ZTENSOR_APPLE_GPU).
 //
-// The CPU model stays the master copy: each forward run reads the facade's
-// weights (copied into shared buffers first), and each backward run adds
-// its gradients into the facade's, so the heads, the losses and the step
-// stay on the CPU, the same for both implementations. A backward run
-// recomputes its forward on the GPU: a run keeps no activations.
+// The CPU model stays the master copy: the runs read a copy of the facade's
+// weights, taken again only when their version has moved (once a step),
+// and the gradients come back into the facade's, so the heads, the losses
+// and the step stay on the CPU, the same for both implementations. The
+// gradients add up on the GPU over a sequence of runs (each run adds its
+// own into a running sum) and come back once at its end: after a batch's
+// backward, or at backward_memories(). A backward run recomputes its
+// forward on the GPU: a run keeps no activations.
 //
 // Three graphs, each made for a capacity on first use (passes and cache
 // rows round up to powers of two; the rest is padding):
@@ -21,11 +24,14 @@
 // added; removing rows closes the gap. The passes' gradients on K and V add
 // up on the GPU (each pass run adds its own into a running sum) until
 // backward_memories() takes the sum back through the memory side in one run.
+// K and V are made from the weights of one version: a pass after the
+// weights have moved makes them again, every row in one run.
 
 #if defined(ZTENSOR_APPLE_GPU)
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -148,6 +154,7 @@ class LowResCrossApple {
       }
       add_pass(*queries[b], sb_[j], sl_[j]);
     }
+    if (kv_version_ != w.version) encode_memories(w, 0);
     std::vector<Bind> in, out{{pg.hidden, pg.hidden_out}};
     bind_inputs(pg.g, pg.in, &in);
     cache_.bind_kv(pg.k, pg.v, &in);
@@ -169,9 +176,8 @@ class LowResCrossApple {
       in.push_back({mg.dv[l], cache_.gv[l]});
     }
     in.push_back({mg.d_rows, cache_.d_rows});
-    bind_grads(mg.g, &out);
-    mg.g.g.run(in, out);
-    zf::apple::add_grads(grads_, w);
+    run_with_grads(mg.g, &in, &out);
+    flush_grads(w);
     cache_.zero_grads();
     pending_ = false;
   }
@@ -198,8 +204,8 @@ class LowResCrossApple {
       dx = bg.dx_out;
       out.push_back({bg.dx, dx});
       fill_d_hidden(d_readout, &d_hidden);
-      bind_grads(bg.g, &out);
-      bg.g.g.run(in, out);
+      run_with_grads(bg.g, &in, &out);
+      flush_grads(w);
       bg.in[bg.d_rows].zero();
     } else {
       PassGraph& pg = *pass_graphs_[{cap_b_, cache_.cap}];
@@ -210,12 +216,10 @@ class LowResCrossApple {
       dx = pg.dx_out;
       out.push_back({pg.dx, dx});
       fill_d_hidden(d_readout, &d_hidden);
-      bind_grads(pg.g, &out);
-      pg.g.g.run(in, out);
+      run_with_grads(pg.g, &in, &out);
       cache_.flip_sums();
       pending_ = true;
     }
-    zf::apple::add_grads(grads_, w);
     std::vector<std::vector<StateGrad>> grads(batch_size());
     for (std::size_t b = 0; b < batch_size(); ++b) {
       grads[b].reserve(query_size(b));
@@ -230,11 +234,12 @@ class LowResCrossApple {
  private:
   enum class Mode { kBatch, kShared };
 
-  // A graph with the weights as its inputs and their gradients.
+  // A graph with the weights as its inputs and their gradients: alone, and
+  // added to a running sum (sum_in + grad).
   struct Weighted {
     zf::apple::Graph g;
     zf::apple::Params params;
-    std::vector<Node> grads;
+    std::vector<Node> grads, sum_in, sum_out;
   };
   struct BatchGraph {
     int batch = 0;
@@ -351,6 +356,10 @@ class LowResCrossApple {
     wrt.insert(wrt.end(), extra.begin(), extra.end());
     std::vector<Node> all = wg.g.gradients(loss, wrt);
     wg.grads.assign(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(wg.params.size()));
+    for (const Node grad : wg.grads) {
+      wg.sum_in.push_back(wg.g.input(wg.g.shape(grad)));
+      wg.sum_out.push_back(wg.g.add(wg.sum_in.back(), grad));
+    }
     return std::vector<Node>(all.begin() + static_cast<std::ptrdiff_t>(wg.params.size()), all.end());
   }
   static Node dot_sum(zf::apple::Graph& g, Node a, Node b) { return g.sum_all(g.mul(a, b)); }
@@ -456,9 +465,18 @@ class LowResCrossApple {
       sl_.push_back(rows->size());
       memory_.insert(memory_.end(), rows->begin(), rows->end());
     }
-    const std::size_t n = memory_.size() - r0;
     const int need = capacity(memory_.size(), 64);
     if (need > cache_.cap) cache_.grow(need, r0, w.layers.size());
+    // The rows already there were made from older weights: all again.
+    encode_memories(w, kv_version_ == w.version ? r0 : 0);
+  }
+
+  // The cache's rows from r0 on through the memory side: their rows, K and
+  // V into the cache.
+  void encode_memories(Weights& w, std::size_t r0) {
+    if (pending_) throw std::logic_error("LowResCross: weights changed before backward_memories()");
+    kv_version_ = w.version;
+    const std::size_t n = memory_.size() - r0;
     if (n == 0) return;
     MemoryGraph& mg = memory_graph(w);
     upload(w);
@@ -482,14 +500,18 @@ class LowResCrossApple {
     }
   }
 
-  // The facade's weights into the buffers every graph reads.
+  // The facade's weights into the buffers every graph reads, when they
+  // have changed since.
   void upload(Weights& w) {
+    if (uploaded_ == w.version) return;
+    uploaded_ = w.version;
     const bool fresh = weights_.empty();
     std::size_t i = 0;
     zf::visit_params(w, [&](auto& t) {
       if (fresh) {
         weights_.emplace_back(t.size());
-        grads_.emplace_back(t.size());
+        sums_.emplace_back(t.size());
+        sums_next_.emplace_back(t.size());
       }
       std::memcpy(weights_.at(i++).data(), t.data(), t.size() * sizeof(float));
     });
@@ -499,8 +521,25 @@ class LowResCrossApple {
     for (std::size_t i = 0; i < nodes.size(); ++i) in->push_back({nodes[i], weights_.at(i)});
     gi.bind(in);
   }
-  void bind_grads(const Weighted& wg, std::vector<Bind>* out) const {
-    for (std::size_t i = 0; i < wg.grads.size(); ++i) out->push_back({wg.grads[i], grads_.at(i)});
+  // A run that computes the weights' gradients: the first of a sequence
+  // writes them into the sum, later ones add to it.
+  void run_with_grads(Weighted& wg, std::vector<Bind>* in, std::vector<Bind>* out) {
+    for (std::size_t i = 0; i < wg.grads.size(); ++i) {
+      if (summing_) {
+        in->push_back({wg.sum_in[i], sums_.at(i)});
+        out->push_back({wg.sum_out[i], sums_next_.at(i)});
+      } else {
+        out->push_back({wg.grads[i], sums_.at(i)});
+      }
+    }
+    wg.g.run(*in, *out);
+    if (summing_) sums_.swap(sums_next_);
+    summing_ = true;
+  }
+  // The sequence's gradients into the facade's.
+  void flush_grads(Weights& w) {
+    if (summing_) zf::apple::add_grads(sums_, w);
+    summing_ = false;
   }
 
   void begin_batch(std::size_t n) {
@@ -531,7 +570,11 @@ class LowResCrossApple {
   std::map<int, std::unique_ptr<BatchGraph>> batch_graphs_;
   std::map<int, std::unique_ptr<MemoryGraph>> memory_graphs_;
   std::map<std::pair<int, int>, std::unique_ptr<PassGraph>> pass_graphs_;
-  std::vector<Buffer> weights_, grads_;
+  // The weights as of version uploaded_; the gradients' running sum
+  // (summing_: a run has written it since the last flush).
+  std::vector<Buffer> weights_, sums_, sums_next_;
+  std::uint64_t uploaded_ = 0;
+  bool summing_ = false;
 
   // The cache: memory j's rows are sl_[j] from sb_[j], in memory_ and in
   // the cache's rows; pending_ while their gradients wait for
@@ -540,6 +583,8 @@ class LowResCrossApple {
   std::vector<Input> memory_;
   std::vector<std::size_t> sb_, sl_;
   bool pending_ = false;
+  // The weights' version K and V were made from.
+  std::uint64_t kv_version_ = 0;
 
   // The batch just run: pass b's queries are [qo_[b], qo_[b+1]) of
   // queries_, its memory rows ml_[b] from mb_[b] of rows_.

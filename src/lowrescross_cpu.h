@@ -16,12 +16,14 @@
 // alone (the memory is fixed through the stack), so each row goes through
 // the memory side once -- its row, norm statistics, every layer's norm, K
 // and V -- when it is added, and rows come and go without touching the
-// others.
+// others. All of it is made from the weights of one version: a pass after
+// the weights have moved makes it again.
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -125,6 +127,7 @@ class LowResCrossCpu {
       mb_[b] = sb_.at(memory_of[b]);
       ml_[b] = sl_.at(memory_of[b]);
     }
+    if (kv_version_ != w.version) encode_memories(w, 0);
     run_passes(w, queries);
   }
   void backward_memories(Weights& w) {
@@ -222,6 +225,14 @@ class LowResCrossCpu {
       memory_.insert(memory_.end(), rows->begin(), rows->end());
     }
     acts_.resize(w.layers.size());
+    // The rows already there were made from older weights: all again.
+    encode_memories(w, kv_version_ == w.version ? r0 : 0);
+  }
+
+  // The cache's rows from r0 on through the memory side.
+  void encode_memories(const Weights& w, std::size_t r0) {
+    if (pending_) throw std::logic_error("LowResCross: weights changed before backward_memories()");
+    kv_version_ = w.version;
     load_memory(w, r0);
     for (std::size_t li = 0; li < acts_.size(); ++li) {
       memory_forward(w.layers[li], acts_[li], r0);
@@ -624,6 +635,7 @@ class LowResCrossCpu {
   std::size_t nb_ = 0, rows_ = 0, mrows_ = 0;
   std::vector<std::size_t> qo_, mb_, ml_, so_, co_, sb_, sl_;
   bool shared_ = false, pending_ = false;
+  std::uint64_t kv_version_ = 0;  // the weights' version the cache was made from
   std::vector<Input> queries_, memory_;
   std::vector<T> x0_, m_, mask_, cmask_, qmask_, mmask_;
   std::vector<RowStats> mstats_;  // the memory rows' norm statistics

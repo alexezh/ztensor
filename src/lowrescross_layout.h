@@ -40,16 +40,21 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <vector>
 
 #include "layers.h"
 #include "tensor.h"
 
-// The environment variable that turns the GPU on (1). A program may name its
-// own before including this.
+// The environment variable that turns the GPU on (1) or off (0). A program
+// may name its own before including this.
 #ifndef ZTENSOR_LOWRES_GPU_ENV
 #define ZTENSOR_LOWRES_GPU_ENV "ZTENSOR_GPU"
+#endif
+// On or off when the variable is not set. A program may turn it on (1).
+#ifndef ZTENSOR_LOWRES_GPU_DEFAULT
+#define ZTENSOR_LOWRES_GPU_DEFAULT 0
 #endif
 
 namespace zf {
@@ -75,13 +80,14 @@ enum class LowResDevice {
   kApple,
 };
 
-// ZTENSOR_LOWRES_GPU_ENV=1 from the environment, on a build with ztensor's
-// GPU target.
+// On a build with ztensor's GPU target: ZTENSOR_LOWRES_GPU_ENV from the
+// environment (1 on, 0 off), else ZTENSOR_LOWRES_GPU_DEFAULT.
 inline bool lowres_gpu_enabled() {
 #if defined(ZTENSOR_APPLE_GPU)
   static const bool on = [] {
     const char* env = std::getenv(ZTENSOR_LOWRES_GPU_ENV);
-    return env != nullptr && std::strtol(env, nullptr, 10) > 0;
+    if (env == nullptr || *env == '\0') return ZTENSOR_LOWRES_GPU_DEFAULT != 0;
+    return std::strtol(env, nullptr, 10) > 0;
   }();
   return on;
 #else
@@ -175,6 +181,10 @@ struct LowResCrossWeights {
 
   std::array<Embedding<T, Layout::kIds, Layout::kIdDim>, Layout::kIdSlots> ids;
   std::vector<Layer> layers;
+  // Moves on every change of the weights (the facade moves it). What an
+  // implementation made from them -- the GPU's copy, the cache's K and V --
+  // is good while it stands.
+  std::uint64_t version = 1;
 
  private:
   template <typename L>

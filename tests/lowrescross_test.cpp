@@ -1,4 +1,5 @@
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <random>
 #include <vector>
@@ -123,6 +124,35 @@ TEST(LowResCross, InputStateGradientMatchesFiniteDifferences) {
   }
   // A step small enough not to cross a ReLU kink.
   zf_test::expect_grads_match(slots, analytic, loss, "input state", 2e-2, 2e-4f);
+}
+
+// The cache's K and V follow the weights: after a step, a pass over memories
+// cached before it reads what a batch made afresh would.
+TEST(LowResCross, TheCacheFollowsTheWeights) {
+  std::mt19937 rng(7);
+  Cross cross(2);
+  cross.randomize(rng);
+  const std::vector<ToyRow> queries = {random_row(rng, true), random_row(rng, false)};
+  const std::vector<ToyRow> memory = {random_row(rng, true), random_row(rng, false), random_row(rng, true)};
+  cross.set_memories({&memory});
+  cross.forward_shared({&queries}, {0});
+  const Cross::Hidden before = cross.readout_of(0);
+  // A step: every weight moves.
+  std::normal_distribution<float> dist(0.0f, 0.05f);
+  cross.visit_layers([&](auto& layer) {
+    zf::visit_params(layer, [&](auto& t) {
+      for (std::size_t i = 0; i < t.size(); ++i) t.data()[i] += dist(rng);
+    });
+  });
+  cross.forward_shared({&queries}, {0});
+  const Cross::Hidden cached = cross.readout_of(0);
+  const Cross::Hidden& fresh = cross.forward(queries, memory);
+  bool moved = false;
+  for (std::size_t i = 0; i < fresh.size(); ++i) {
+    EXPECT_NEAR(cached.data()[i], fresh.data()[i], 1e-5f) << i;
+    moved = moved || std::abs(before.data()[i] - fresh.data()[i]) > 1e-3f;
+  }
+  EXPECT_TRUE(moved);
 }
 
 }  // namespace

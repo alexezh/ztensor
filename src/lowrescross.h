@@ -40,7 +40,18 @@
 // are not cached: every pass's queries attend to each other both ways. The
 // memories' gradients add up over every backward_batch() until
 // backward_memories() takes them back through once; the memories cannot
-// change in between. Any forward_batch() ends the cache.
+// change in between, nor can the weights. When the weights change (a step)
+// the cache's K and V are made again from them before the next pass reads
+// them. Any forward_batch() ends the cache.
+//
+// Weights and gradients on the GPU: the implementation keeps its own copy
+// of the weights and takes them again only when they have changed (a
+// version the facade moves on randomize(), apply_sgd() and visit_layers()),
+// so a model that runs many batches in a step uploads its weights once.
+// Its gradients add up on the GPU over a sequence of runs -- a batch's
+// backward, or every pass over the memories' cache until
+// backward_memories() -- and come back into the weights' gradients once at
+// its end.
 //
 // Readouts are read off the final state (readout()), unnormalized: a
 // readout row has few present slots, and a norm over its mostly-absent
@@ -104,6 +115,7 @@ class LowResCross {
   template <typename Rng>
   void randomize(Rng& rng) {
     w_.randomize(rng);
+    ++w_.version;
   }
 
   // Every pass of `batch` at once.
@@ -218,13 +230,18 @@ class LowResCross {
     return std::move(backward_batch(d)[0]);
   }
 
+  // The layers, to read or change: the weights count as changed (an
+  // optimizer, a load, a copy into a replica), so the implementation takes
+  // them afresh before its next run. A pointer kept from one visit must not
+  // write into the weights after the next run.
   template <typename Visit>
   void visit_layers(Visit&& visit) {
+    ++w_.version;
     w_.visit_layers(visit);
   }
 
   void zero_grad() {
-    visit_layers([](auto& l) { l.zero_grad(); });
+    w_.visit_layers([](auto& l) { l.zero_grad(); });
   }
   void apply_sgd(T lr) {
     visit_layers([lr](auto& l) { l.apply_sgd(lr); });
