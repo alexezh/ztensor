@@ -1,7 +1,9 @@
 # ztensor
 
 For my prototypes, I needed a C++ tensor library for both training and inference. 
-My prototype models are small (millions of params) so there is no need in GPU. 
+My prototype models are small (millions of params) so there is no need in GPU. Correction, 
+as CPU training time increased to 30 min on M2, I added support for Apple GPU which improved speed 
+by 2x-3x especially for RL. Neural engine is not that useful for training, so I am not using it.
 
 I looked at top projects with similar code and they were too big; and I did the common thing nowadays - vibe-coded 
 a small C++20 tensor and transformer library. ZTenzor is fixed-size tensors, hand-written
