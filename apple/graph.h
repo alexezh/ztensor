@@ -106,6 +106,10 @@ class Graph {
   Node sigmoid(Node a);
   // 1 where a > b, else 0.
   Node greater(Node a, Node b);
+  // a, through which no gradient flows: a loss term that reads it treats it
+  // as a constant (a label made from the model's own output). To a
+  // resolution of 2^-16 (exact for |a| < 2^8).
+  Node stop_gradient(Node a);
 
   // Reductions over `axes` (negative counts from the end); the reduced axes
   // stay, with length 1. MPSGraph has no gradient for max: a loss must not

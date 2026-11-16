@@ -167,6 +167,17 @@ Node Graph::greater(Node a, Node b) {
   return impl_->put([impl_->g castTensor:t toType:MPSDataTypeFloat32 name:@"greater"], {a, b});
 }
 
+Node Graph::stop_gradient(Node a) {
+  // MPSGraph (as of this SDK) has no stop-gradient op, but floor has no
+  // gradient: a to a resolution of 2^-16 (exact for |a| < 2^8), through
+  // floor. No parents: gradients() does not look past it.
+  MPSGraph* g = impl_->g;
+  MPSGraphTensor* s = [g constantWithScalar:65536.0 dataType:MPSDataTypeFloat32];
+  MPSGraphTensor* q = [g floorWithTensor:[g multiplicationWithPrimaryTensor:impl_->at(a) secondaryTensor:s name:nil]
+                                    name:nil];
+  return impl_->put([g divisionWithPrimaryTensor:q secondaryTensor:s name:nil]);
+}
+
 Node Graph::sum(Node a, const std::vector<int>& axes) {
   return impl_->put([impl_->g reductionSumWithTensor:impl_->at(a) axes:impl_->axes(a, axes) name:nil], {a});
 }
