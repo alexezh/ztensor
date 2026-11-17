@@ -128,3 +128,10 @@ endif()
 # Microbenchmarks for the hot paths; reports timings, not pass/fail.
 add_executable(ztensor_bench benchmarks/tensor_bench.cpp)
 target_link_libraries(ztensor_bench PRIVATE ztensor)
+
+# LowResCross at a policy's size: timings and CPU / GPU load per way of stepping.
+add_executable(lowrescross_bench benchmarks/lowrescross_bench.cpp)
+target_link_libraries(lowrescross_bench PRIVATE ztensor)
+if(ZTENSOR_APPLE_GPU)
+  target_link_libraries(lowrescross_bench PRIVATE ztensor_apple)
+endif()
