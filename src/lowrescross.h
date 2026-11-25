@@ -333,22 +333,7 @@ class LowResCross {
   Cpu cpu_;
 #if defined(ZTENSOR_APPLE_GPU)
   using Gpu = LowResCrossApple<T, Layout, Q, M, Heads, HeadDim, Ffn>;
-  // Made on first use; a copy of the model starts without one (the GPU's
-  // buffers are not the copy's).
-  struct GpuSlot {
-    GpuSlot() = default;
-    GpuSlot(const GpuSlot&) {}
-    GpuSlot& operator=(const GpuSlot&) {
-      p.reset();
-      return *this;
-    }
-    Gpu& get() const {
-      if (p == nullptr) p = std::make_shared<Gpu>();
-      return *p;
-    }
-    mutable std::shared_ptr<Gpu> p;
-  };
-  GpuSlot gpu_;
+  LowResGpuSlot<Gpu> gpu_;
 #endif
   Hidden readout0_{};
 };

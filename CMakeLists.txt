@@ -63,7 +63,7 @@ if(ZTENSOR_NATIVE)
   endif()
 endif()
 
-# zf::apple (apple/): training graphs on the GPU, on MPSGraph. Apple only;
+# zf::apple (src/apple/): training graphs on the GPU, on MPSGraph. Apple only;
 # CPU-only builds are unchanged.
 if(APPLE)
   option(ZTENSOR_APPLE_GPU "Build zf::apple, training graphs on the GPU (MPSGraph)" ON)
@@ -72,11 +72,8 @@ else()
 endif()
 if(ZTENSOR_APPLE_GPU)
   enable_language(OBJCXX)
-  add_library(ztensor_apple apple/graph.mm)
-  # #include "apple/graph.h"
-  target_include_directories(ztensor_apple PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-  )
+  # #include "apple/graph.h", through ztensor's src/
+  add_library(ztensor_apple src/apple/graph.mm)
   target_compile_options(ztensor_apple PRIVATE -fobjc-arc ${ZTENSOR_WARNINGS})
   target_compile_definitions(ztensor_apple PUBLIC ZTENSOR_APPLE_GPU)
   target_link_libraries(ztensor_apple PUBLIC ztensor
@@ -107,6 +104,7 @@ if(ZTENSOR_BUILD_TESTS)
     tests/thread_pool_test.cpp
     tests/replicas_test.cpp
     tests/lowrescross_test.cpp
+    tests/focuscross_test.cpp
     tests/rl_trainer_test.cpp
   )
   target_include_directories(ztensor_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)

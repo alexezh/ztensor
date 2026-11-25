@@ -1,6 +1,6 @@
 # Apple GPU
 
-`apple/`: training graphs on the GPU, on Metal Performance Shaders Graph.
+`src/apple/`: training graphs on the GPU, on Metal Performance Shaders Graph.
 Built with `-DZTENSOR_APPLE_GPU=ON`, the default on Apple. The target is
 `ztensor_apple`, and it defines `ZTENSOR_APPLE_GPU` for whatever links it.
 CPU-only builds don't change.
@@ -101,3 +101,16 @@ else { /* forward_batch, the heads on the CPU, backward_batch */ }
 - The test `LowResCross.AStepOnTheGpuMatchesTheCpu` checks a step against the
   CPU path: a linear head with squared error and a pointer with cross
   entropy.
+
+## FocusCross on the GPU
+
+`apple/focuscross_apple.h` runs [FocusCross](focuscross.md) the same way,
+with two graphs per capacity:
+- **batch:** `forward_batch` and `backward_batch`. It returns the readouts,
+  the final workspace rows and every level's relevance.
+- **step:** `step_batch` with the model's heads.
+
+`apple/focuscross_graph.h` builds its stack on LowResCross's pieces. There's
+no memories' cache. Both models keep the facade's weights as the master copy
+through `apple/weighted.h`: a graph that reads the weights, and the running
+sum of their gradients.

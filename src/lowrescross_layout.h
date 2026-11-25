@@ -42,6 +42,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <memory>
 #include <vector>
 
 #include "layers.h"
@@ -104,6 +105,23 @@ inline LowResDevice lowres_device_for(std::size_t passes) {
   return lowres_gpu_enabled() && passes >= kLowResGpuMinPasses ? LowResDevice::kApple
                                                                 : LowResDevice::kCpu;
 }
+
+// A facade's GPU implementation, made on first use. A copy of the model
+// starts without one (the GPU's buffers are not the copy's).
+template <typename Gpu>
+struct LowResGpuSlot {
+  LowResGpuSlot() = default;
+  LowResGpuSlot(const LowResGpuSlot&) {}
+  LowResGpuSlot& operator=(const LowResGpuSlot&) {
+    p.reset();
+    return *this;
+  }
+  Gpu& get() const {
+    if (p == nullptr) p = std::make_shared<Gpu>();
+    return *p;
+  }
+  mutable std::shared_ptr<Gpu> p;
+};
 
 // --- the weights -------------------------------------------------------------
 

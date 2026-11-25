@@ -24,6 +24,7 @@
 
 #include <sys/resource.h>
 
+#include "focuscross.h"
 #include "loss.h"
 #include "lowrescross.h"
 #include "thread_pool.h"
@@ -254,6 +255,25 @@ int main(int argc, char** argv) {
   }
   cross.set_pool(nullptr);
 
+  // FocusCross at the same size: the workspace's own attention at every
+  // level on top.
+  zf::FocusCross<float, Layout, kQ, kM, 4, 16, 128> focus(kLevels);
+  focus.randomize(rng);
+  focus.set_device(zf::LowResDevice::kCpu);
+  for (std::size_t n : {16, 64}) {
+    const auto batch = passes(n);
+    std::vector<Cross::Hidden> dn(d.begin(), d.begin() + n);
+    for (zf::ThreadPool* p : {static_cast<zf::ThreadPool*>(nullptr), &pool}) {
+      focus.set_pool(p);
+      const std::string name = "focus cpu fwd+bwd b" + std::to_string(n) + (p ? " pool" : " 1 thread");
+      measure(name.c_str(), n, seconds, [&] {
+        focus.forward_batch(batch);
+        focus.backward_batch(dn);
+      });
+    }
+  }
+  focus.set_pool(nullptr);
+
 #if defined(ZTENSOR_APPLE_GPU)
   cross.set_device(zf::LowResDevice::kApple);
   // Acting: forward only, the weights unchanged (uploaded once).
@@ -282,6 +302,20 @@ int main(int argc, char** argv) {
       heads.visit_layers([](auto& l) { l.zero_grad(); });
       cross.step_batch(batch, heads);
       cross.apply_sgd(1e-6f);
+      heads.visit_layers([](auto& l) { l.apply_sgd(1e-6f); });
+    });
+  }
+  // FocusCross, one run: step_batch with the heads, then the step.
+  focus.set_device(zf::LowResDevice::kApple);
+  for (std::size_t n : {64, 128, 256}) {
+    const auto batch = passes(n);
+    heads.picked.resize(n);
+    heads.target.resize(n);
+    measure(("focus gpu step_batch+sgd b" + std::to_string(n)).c_str(), n, seconds, [&] {
+      focus.zero_grad();
+      heads.visit_layers([](auto& l) { l.zero_grad(); });
+      focus.step_batch(batch, heads);
+      focus.apply_sgd(1e-6f);
       heads.visit_layers([](auto& l) { l.apply_sgd(1e-6f); });
     });
   }

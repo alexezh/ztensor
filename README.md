@@ -68,5 +68,6 @@ for (m...) { symbol.backward(ids[m], row(d_memory, m)); position.backward(m, row
 - [Core](docs/core.md): build options, threads, data-parallel batches, bf16
 - [Transformer](docs/transformer.md): encoder and decoder blocks, activation, batching
 - [LowResCross](docs/lowrescross.md): a cross transformer over wide, sparse rows
+- [FocusCross](docs/focuscross.md): LowResCross with a workspace refined at every level, focused by relevance
 - [Apple GPU](docs/apple_gpu.md): training graphs on Metal (MPSGraph)
 - [Reinforcement learning](docs/rl.md): RLTrainer, policy-gradient rounds

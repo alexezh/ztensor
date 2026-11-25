@@ -4,14 +4,12 @@
 // zf::apple graphs (lowrescross_graph.h has the pieces). Built only with
 // ztensor's GPU target (ZTENSOR_APPLE_GPU).
 //
-// The CPU model stays the master copy: the runs read a copy of the facade's
-// weights, taken again only when their version has moved (once a step),
-// and the gradients come back into the facade's, so the step stays on the
-// CPU, the same for both implementations. The gradients add up on the GPU
-// over a sequence of runs (each run adds its own into a running sum) and
-// come back once at its end: after a batch's backward, or at
-// backward_memories(). A backward run recomputes its forward on the GPU: a
-// run keeps no activations.
+// The CPU model stays the master copy (weighted.h): the runs read a copy of
+// the facade's weights, and the gradients come back into the facade's, so
+// the step stays on the CPU, the same for both implementations. A
+// sequence's gradients come back once at its end: after a batch's backward,
+// or at backward_memories(). A backward run recomputes its forward on the
+// GPU: a run keeps no activations.
 //
 // Four graphs, each made for a capacity on first use (passes and cache
 // rows round up to powers of two; the rest is padding):
@@ -50,6 +48,7 @@
 #include "apple/nn.h"
 #include "apple/params.h"
 #include "apple/lowrescross_graph.h"
+#include "apple/weighted.h"
 #include "lowrescross_layout.h"
 
 namespace zf {
@@ -249,13 +248,7 @@ class LowResCrossApple {
  private:
   enum class Mode { kBatch, kShared, kStep };
 
-  // A graph with the weights as its inputs and their gradients: alone, and
-  // added to a running sum (sum_in + grad).
-  struct Weighted {
-    zf::apple::Graph g;
-    zf::apple::Params params;
-    std::vector<Node> grads, sum_in, sum_out;
-  };
+  using Weighted = zf::apple::Weighted;
   // Passes as the batch and step graphs take them: each pass's query rows,
   // its memory rows, and which of those are keys.
   struct Block {
@@ -382,20 +375,9 @@ class LowResCrossApple {
     return c;
   }
 
-  void make_weighted(Weights& w, Weighted* out) {
-    out->params.declare(out->g, w);
-  }
-  // The gradients of `loss` on the weights (and on `extra`, returned).
-  std::vector<Node> weigh(Weighted& wg, Node loss, const std::vector<Node>& extra) {
-    std::vector<Node> wrt = wg.params.nodes();
-    wrt.insert(wrt.end(), extra.begin(), extra.end());
-    std::vector<Node> all = wg.g.gradients(loss, wrt);
-    wg.grads.assign(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(wg.params.size()));
-    for (const Node grad : wg.grads) {
-      wg.sum_in.push_back(wg.g.input(wg.g.shape(grad)));
-      wg.sum_out.push_back(wg.g.add(wg.sum_in.back(), grad));
-    }
-    return std::vector<Node>(all.begin() + static_cast<std::ptrdiff_t>(wg.params.size()), all.end());
+  void make_weighted(Weights& w, Weighted* out) { out->declare(w); }
+  static std::vector<Node> weigh(Weighted& wg, Node loss, const std::vector<Node>& extra) {
+    return wg.weigh(loss, extra);
   }
   static Node dot_sum(zf::apple::Graph& g, Node a, Node b) { return g.sum_all(g.mul(a, b)); }
 
@@ -563,47 +545,15 @@ class LowResCrossApple {
     }
   }
 
-  // The facade's weights into the buffers every graph reads, when they
-  // have changed since.
-  void upload(Weights& w) {
-    if (uploaded_ == w.version) return;
-    uploaded_ = w.version;
-    const bool fresh = weights_.empty();
-    std::size_t i = 0;
-    zf::visit_params(w, [&](auto& t) {
-      if (fresh) {
-        weights_.emplace_back(t.size());
-        sums_.emplace_back(t.size());
-        sums_next_.emplace_back(t.size());
-      }
-      std::memcpy(weights_.at(i++).data(), t.data(), t.size() * sizeof(float));
-    });
-  }
+  void upload(Weights& w) { runs_.upload(w); }
   void bind_inputs(const Weighted& wg, const LowResGraphInputs& gi, std::vector<Bind>* in) const {
-    const std::vector<Node>& nodes = wg.params.nodes();
-    for (std::size_t i = 0; i < nodes.size(); ++i) in->push_back({nodes[i], weights_.at(i)});
+    runs_.bind(wg, in);
     gi.bind(in);
   }
-  // A run that computes the weights' gradients: the first of a sequence
-  // writes them into the sum, later ones add to it.
   void run_with_grads(Weighted& wg, std::vector<Bind>* in, std::vector<Bind>* out) {
-    for (std::size_t i = 0; i < wg.grads.size(); ++i) {
-      if (summing_) {
-        in->push_back({wg.sum_in[i], sums_.at(i)});
-        out->push_back({wg.sum_out[i], sums_next_.at(i)});
-      } else {
-        out->push_back({wg.grads[i], sums_.at(i)});
-      }
-    }
-    wg.g.run(*in, *out);
-    if (summing_) sums_.swap(sums_next_);
-    summing_ = true;
+    runs_.run_with_grads(wg, in, out);
   }
-  // The sequence's gradients into the facade's.
-  void flush_grads(Weights& w) {
-    if (summing_) zf::apple::add_grads(sums_, w);
-    summing_ = false;
-  }
+  void flush_grads(Weights& w) { runs_.flush(w); }
 
   // `batch` into a block's inputs (every input zeroed first), and the
   // batch's bookkeeping.
@@ -656,11 +606,7 @@ class LowResCrossApple {
   std::map<int, std::unique_ptr<MemoryGraph>> memory_graphs_;
   std::map<std::pair<int, int>, std::unique_ptr<PassGraph>> pass_graphs_;
   std::map<std::pair<std::type_index, int>, std::unique_ptr<AnyStep>> step_graphs_;
-  // The weights as of version uploaded_; the gradients' running sum
-  // (summing_: a run has written it since the last flush).
-  std::vector<Buffer> weights_, sums_, sums_next_;
-  std::uint64_t uploaded_ = 0;
-  bool summing_ = false;
+  zf::apple::WeightRuns runs_;
 
   // The cache: memory j's rows are sl_[j] from sb_[j], in memory_ and in
   // the cache's rows; pending_ while their gradients wait for

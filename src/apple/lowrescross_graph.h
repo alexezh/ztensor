@@ -112,8 +112,10 @@ class LowResCrossGraph {
     Node k, v;
   };
 
-  // The weights, taken from `params` in LowResCrossWeights' visit order.
-  LowResCrossGraph(zf::apple::Graph& g, zf::apple::Params& params, std::size_t levels) : g_(g) {
+  // The weights, taken from `params` in LowResCrossWeights' visit order;
+  // `last`: no parameters follow (a model that extends LowResCross's
+  // weights takes its own after).
+  LowResCrossGraph(zf::apple::Graph& g, zf::apple::Params& params, std::size_t levels, bool last = true) : g_(g) {
     for (int s = 0; s < kSlots; ++s) ids_.push_back(params.next());
     for (std::size_t l = 0; l < levels; ++l) {
       Layer w;
@@ -123,7 +125,7 @@ class LowResCrossGraph {
       }
       layers_.push_back(w);
     }
-    if (!params.all_taken()) throw std::logic_error("LowResCrossGraph: parameters left over");
+    if (last && !params.all_taken()) throw std::logic_error("LowResCrossGraph: parameters left over");
   }
 
   Rows rows(LowResGraphInputs& in, int n) {
@@ -232,7 +234,7 @@ class LowResCrossGraph {
     std::fill(s, s + qs.batch * qs.q, kNoKey);
   }
 
- private:
+ protected:
   struct Norm {
     Node gamma, beta;
   };

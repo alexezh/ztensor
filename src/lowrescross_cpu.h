@@ -31,6 +31,7 @@
 #include "layers.h"
 #include "tensor.h"
 #include "thread_pool.h"
+#include "lowres_attention.h"
 #include "lowrescross_layout.h"
 
 namespace zf {
@@ -194,6 +195,7 @@ class LowResCrossCpu {
 
  private:
   using RowStats = typename LayerNorm<T, kStream>::RowStats;
+  using Attn = LowResAttention<T, Heads, HeadDim, (Q > M ? Q : M)>;
 
   // A layer's activations, row-stacked: rows_ query rows, mrows_ memory rows.
   struct Acts {
@@ -388,143 +390,6 @@ class LowResCrossCpu {
     }
   }
 
-  // One head's slice of two rows: HeadDim long, four lanes at a time.
-  static T dot(const T* a, const T* b) {
-    if constexpr (HeadDim % 4 == 0) {
-      Vec4<T> acc{};
-      for (std::size_t d = 0; d < HeadDim; d += 4) acc += load4(a + d) * load4(b + d);
-      return hsum4(acc);
-    } else {
-      T s{};
-      for (std::size_t d = 0; d < HeadDim; ++d) s += a[d] * b[d];
-      return s;
-    }
-  }
-  // y += w x over one head's slice.
-  static void axpy(T w, const T* ZF_RESTRICT x, T* ZF_RESTRICT y) {
-    for (std::size_t d = 0; d < HeadDim; ++d) y[d] += w * x[d];
-  }
-
-  // One head's slice of one row, held in registers while a loop runs over
-  // the other rows (HeadDim % 4 == 0): attention's query, context and
-  // gradient slices stay put instead of being reloaded for every key.
-  struct Slice {
-    using V = Vec4<T>;
-    static constexpr std::size_t kLanes = HeadDim / 4;
-    V v[kLanes];
-
-    static Slice load(const T* p) {
-      Slice s;
-      for (std::size_t d = 0; d < kLanes; ++d) s.v[d] = load4(p + 4 * d);
-      return s;
-    }
-    static Slice zero() {
-      Slice s;
-      for (std::size_t d = 0; d < kLanes; ++d) s.v[d] = V{};
-      return s;
-    }
-    void store(T* p) const {
-      for (std::size_t d = 0; d < kLanes; ++d) store4(p + 4 * d, v[d]);
-    }
-    T dot(const T* p) const {
-      V acc = v[0] * load4(p);
-      for (std::size_t d = 1; d < kLanes; ++d) acc += v[d] * load4(p + 4 * d);
-      return hsum4(acc);
-    }
-    // *this += w p
-    void add(T w, const T* p) {
-      const V s{w, w, w, w};
-      for (std::size_t d = 0; d < kLanes; ++d) v[d] += s * load4(p + 4 * d);
-    }
-    // p += w *this
-    void add_to(T w, T* p) const {
-      const V s{w, w, w, w};
-      for (std::size_t d = 0; d < kLanes; ++d) store4(p + 4 * d, load4(p + 4 * d) + s * v[d]);
-    }
-  };
-
-  // Scaled dot-product attention of nq query rows over nk key rows, rows of
-  // HD (Heads x HeadDim). p: Heads x nq x nk. Overwrites ctx's nq rows.
-  static void attend(const T* q, const T* k, const T* v, std::size_t nq, std::size_t nk, T* p, T* ctx) {
-    const T scale = static_cast<T>(1.0 / std::sqrt(static_cast<double>(HeadDim)));
-    if constexpr (HeadDim % 4 != 0) std::fill(ctx, ctx + nq * HD, T{});
-    for (std::size_t h = 0; h < Heads; ++h) {
-      const std::size_t o = h * HeadDim;
-      for (std::size_t i = 0; i < nq; ++i) {
-        T* pi = p + (h * nq + i) * nk;
-        T top = std::numeric_limits<T>::lowest();
-        if constexpr (HeadDim % 4 == 0) {
-          const Slice qi = Slice::load(q + i * HD + o);
-          for (std::size_t j = 0; j < nk; ++j) {
-            pi[j] = qi.dot(k + j * HD + o) * scale;
-            top = std::max(top, pi[j]);
-          }
-        } else {
-          const T* qi = q + i * HD + o;
-          for (std::size_t j = 0; j < nk; ++j) {
-            pi[j] = dot(qi, k + j * HD + o) * scale;
-            top = std::max(top, pi[j]);
-          }
-        }
-        T sum{};
-        for (std::size_t j = 0; j < nk; ++j) sum += pi[j] = std::exp(pi[j] - top);
-        const T inv = T{1} / sum;
-        if constexpr (HeadDim % 4 == 0) {
-          Slice ci = Slice::zero();
-          for (std::size_t j = 0; j < nk; ++j) ci.add(pi[j] *= inv, v + j * HD + o);
-          ci.store(ctx + i * HD + o);
-        } else {
-          T* ci = ctx + i * HD + o;
-          for (std::size_t j = 0; j < nk; ++j) axpy(pi[j] *= inv, v + j * HD + o, ci);
-        }
-      }
-    }
-  }
-
-  // Adds into d_q, d_k, d_v.
-  static void attend_back(const T* q, const T* k, const T* v, const T* p, const T* d_ctx, std::size_t nq,
-                          std::size_t nk, T* d_q, T* d_k, T* d_v) {
-    const T scale = static_cast<T>(1.0 / std::sqrt(static_cast<double>(HeadDim)));
-    std::array<T, (Q > M ? Q : M)> dp{};
-    for (std::size_t h = 0; h < Heads; ++h) {
-      const std::size_t o = h * HeadDim;
-      for (std::size_t i = 0; i < nq; ++i) {
-        const T* pi = p + (h * nq + i) * nk;
-        T pdp{};
-        if constexpr (HeadDim % 4 == 0) {
-          const Slice gi = Slice::load(d_ctx + i * HD + o);
-          for (std::size_t j = 0; j < nk; ++j) {
-            dp[j] = gi.dot(v + j * HD + o);
-            pdp += dp[j] * pi[j];
-            gi.add_to(pi[j], d_v + j * HD + o);
-          }
-          const Slice qi = Slice::load(q + i * HD + o);
-          Slice dqi = Slice::load(d_q + i * HD + o);
-          for (std::size_t j = 0; j < nk; ++j) {
-            const T ds = pi[j] * (dp[j] - pdp) * scale;
-            dqi.add(ds, k + j * HD + o);
-            qi.add_to(ds, d_k + j * HD + o);
-          }
-          dqi.store(d_q + i * HD + o);
-        } else {
-          const T* gi = d_ctx + i * HD + o;
-          for (std::size_t j = 0; j < nk; ++j) {
-            dp[j] = dot(gi, v + j * HD + o);
-            pdp += dp[j] * pi[j];
-            axpy(pi[j], gi, d_v + j * HD + o);
-          }
-          const T* qi = q + i * HD + o;
-          T* dqi = d_q + i * HD + o;
-          for (std::size_t j = 0; j < nk; ++j) {
-            const T ds = pi[j] * (dp[j] - pdp) * scale;
-            axpy(ds, k + j * HD + o, dqi);
-            axpy(ds, qi, d_k + j * HD + o);
-          }
-        }
-      }
-    }
-  }
-
   void layer_forward(const WLayer& wl, Acts& l, const std::vector<T>& x) {
     // self
     norm(wl.n1, x, rows_, qmask_.data(), &l.s1, &l.xn1);
@@ -535,7 +400,7 @@ class LowResCrossCpu {
     l.ps.resize(so_[nb_]);
     each_pass([&](std::size_t b) {
       const std::size_t o = qo_[b] * HD, n = query_size(b);
-      attend(l.q.data() + o, l.k.data() + o, l.v.data() + o, n, n, l.ps.data() + so_[b], l.ctx.data() + o);
+      Attn::attend(l.q.data() + o, l.k.data() + o, l.v.data() + o, n, n, l.ps.data() + so_[b], l.ctx.data() + o);
     });
     linear(wl.os, l.ctx, rows_, &u_);
     l.x1 = x;
@@ -552,7 +417,7 @@ class LowResCrossCpu {
         const std::size_t nm = memory_size(b);
         if (nm == 0) return;
         const std::size_t o = qo_[b] * HD, mo = mb_[b] * HD;
-        attend(l.qc_.data() + o, l.kc_.data() + mo, l.vc_.data() + mo, query_size(b), nm, l.pc.data() + co_[b],
+        Attn::attend(l.qc_.data() + o, l.kc_.data() + mo, l.vc_.data() + mo, query_size(b), nm, l.pc.data() + co_[b],
                l.ctx_c.data() + o);
       });
       linear(wl.oc, l.ctx_c, rows_, &u_);
@@ -595,7 +460,7 @@ class LowResCrossCpu {
         const std::size_t nm = memory_size(b);
         if (nm == 0) return;
         const std::size_t o = qo_[b] * HD, mo = mb_[b] * HD;
-        attend_back(l.qc_.data() + o, l.kc_.data() + mo, l.vc_.data() + mo, l.pc.data() + co_[b], gc_.data() + o,
+        Attn::attend_back(l.qc_.data() + o, l.kc_.data() + mo, l.vc_.data() + mo, l.pc.data() + co_[b], gc_.data() + o,
                     query_size(b), nm, gq_.data() + o, gk.data() + mo, gv.data() + mo);
       };
       // Passes that share a memory add into the same rows: one at a time.
@@ -616,7 +481,7 @@ class LowResCrossCpu {
     zeroed(&gv_, rows_ * HD);
     each_pass([&](std::size_t b) {
       const std::size_t o = qo_[b] * HD, n = query_size(b);
-      attend_back(l.q.data() + o, l.k.data() + o, l.v.data() + o, l.ps.data() + so_[b], gc_.data() + o, n, n,
+      Attn::attend_back(l.q.data() + o, l.k.data() + o, l.v.data() + o, l.ps.data() + so_[b], gc_.data() + o, n, n,
                   gq_.data() + o, gk_.data() + o, gv_.data() + o);
     });
     linear_back(wl.qs, l.xn1, gq_, rows_, &gs_);
